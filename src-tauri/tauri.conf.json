@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "yvaine_astra_ai",
+  "productName": "Yvaine Astra AI",
   "version": "0.1.0",
   "identifier": "com.sherlyn.yvaine_astra_ai",
   "build": {
@@ -12,9 +12,15 @@
   "app": {
     "windows": [
       {
-        "title": "yvaine_astra_ai",
-        "width": 800,
-        "height": 600
+        "title": "Yvaine Astra AI",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 800,
+        "minHeight": 600,
+        "center": true,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true
       }
     ],
     "security": {

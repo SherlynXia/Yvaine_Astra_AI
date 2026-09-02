@@ -17,10 +17,31 @@ dist-ssr/
 !.vscode/extensions.json
 .idea
 src-tauri/target/
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+ENV/
+env.bak/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+
+# Backend
+backend/__pycache__/
+backend/**/__pycache__/
+
 .DS_Store
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
-

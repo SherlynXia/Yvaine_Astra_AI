@@ -1,6 +1,7 @@
 import { ref } from 'vue';
 import * as PIXI from 'pixi.js';
 import { Live2DModel } from 'pixi-live2d-display/cubism4';
+import type { PhonemeInfo } from './useWebSocket';
 
 Live2DModel.registerTicker(PIXI.Ticker);
 
@@ -46,6 +47,11 @@ export function useLive2D() {
   // 口型动画状态
   let mouthAnimationId: number | null = null;
   let isSpeaking = false;
+
+  // Phoneme 时间轴数据
+  let phonemeTimeline: PhonemeInfo[] = [];
+  let phonemeStartTime = 0;  // 音频开始播放的时间戳
+  let currentPhonemeIndex = 0;
 
   async function init(container: HTMLElement) {
     app.value = new PIXI.Application({
@@ -266,13 +272,190 @@ export function useLive2D() {
     currentAccessories.value.clear();
   }
 
-  // 口型动画 - 根据文本模拟说话节奏
-  function startSpeaking(text: string, speed: number = 150) {
-    if (!model.value || isSpeaking) return;
+  // 音素到口型参数的映射表（与后端保持一致）
+  const PHONEME_TO_MOUTH: Record<string, { open: number; form: number }> = {
+    // 中文元音
+    a: { open: 1.0, form: 0.0 },
+    o: { open: 0.6, form: 0.5 },
+    e: { open: 0.5, form: 0.0 },
+    i: { open: 0.2, form: -0.8 },
+    u: { open: 0.2, form: 1.0 },
+    v: { open: 0.2, form: 0.8 },
+    ai: { open: 0.8, form: -0.3 },
+    ei: { open: 0.5, form: -0.5 },
+    ao: { open: 0.7, form: 0.3 },
+    ou: { open: 0.5, form: 0.6 },
+    an: { open: 0.7, form: 0.0 },
+    en: { open: 0.4, form: 0.0 },
+    ang: { open: 0.8, form: 0.0 },
+    eng: { open: 0.4, form: 0.0 },
+    ong: { open: 0.5, form: 0.5 },
+    er: { open: 0.4, form: 0.0 },
+    // 英文元音
+    aa: { open: 1.0, form: 0.0 },
+    ae: { open: 0.9, form: -0.2 },
+    ah: { open: 0.8, form: 0.0 },
+    ao_e: { open: 0.7, form: 0.4 },
+    eh: { open: 0.5, form: -0.3 },
+    er_e: { open: 0.4, form: 0.0 },
+    ih: { open: 0.3, form: -0.5 },
+    iy: { open: 0.3, form: -0.7 },
+    uh: { open: 0.3, form: 0.3 },
+    uw: { open: 0.25, form: 0.9 },
+    // 辅音
+    b: { open: 0.0, form: 0.0 },
+    p: { open: 0.0, form: 0.0 },
+    m: { open: 0.0, form: 0.0 },
+    f: { open: 0.1, form: 0.0 },
+    d: { open: 0.1, form: 0.0 },
+    t: { open: 0.1, form: 0.0 },
+    n: { open: 0.15, form: 0.0 },
+    l: { open: 0.2, form: 0.0 },
+    g: { open: 0.1, form: 0.0 },
+    k: { open: 0.1, form: 0.0 },
+    h: { open: 0.2, form: 0.0 },
+    j: { open: 0.15, form: -0.3 },
+    q: { open: 0.15, form: -0.3 },
+    x: { open: 0.2, form: -0.3 },
+    zh: { open: 0.1, form: 0.0 },
+    ch: { open: 0.1, form: 0.0 },
+    sh: { open: 0.2, form: 0.0 },
+    r: { open: 0.2, form: 0.0 },
+    z: { open: 0.1, form: 0.0 },
+    c: { open: 0.1, form: 0.0 },
+    s: { open: 0.15, form: 0.0 },
+    y: { open: 0.2, form: -0.5 },
+    w: { open: 0.15, form: 0.6 },
+    th: { open: 0.15, form: 0.0 },
+    dh: { open: 0.15, form: 0.0 },
+    ng: { open: 0.2, form: 0.0 },
+    hh: { open: 0.2, form: 0.0 },
+    jh: { open: 0.15, form: -0.2 },
+    ch_e: { open: 0.1, form: 0.0 },
+  };
+
+  function getMouthShape(phoneme: string): { open: number; form: number } {
+    const p = phoneme.toLowerCase().trim();
+    if (PHONEME_TO_MOUTH[p]) return PHONEME_TO_MOUTH[p];
+    // 去掉声调数字
+    const noTone = p.replace(/\d/g, '');
+    if (PHONEME_TO_MOUTH[noTone]) return PHONEME_TO_MOUTH[noTone];
+    // 首字母匹配
+    if (noTone) {
+      const first = noTone[0];
+      if (PHONEME_TO_MOUTH[first]) return PHONEME_TO_MOUTH[first];
+    }
+    return { open: 0.2, form: 0.0 };
+  }
+
+  // 设置 phoneme 时间轴数据（从后端接收）
+  function setPhonemeTimeline(phonemes: PhonemeInfo[]) {
+    phonemeTimeline = phonemes;
+    currentPhonemeIndex = 0;
+  }
+
+  // 基于 phoneme 时间轴的精确口型同步
+  function startSpeakingWithPhonemes(phonemes: PhonemeInfo[], audioStartTime?: number) {
+    if (!model.value) return;
+    // 如果正在说话，先停止之前的口型动画
+    if (isSpeaking) {
+      stopSpeaking();
+    }
     isSpeaking = true;
 
-    const chars = text.length;
-    const duration = Math.max(chars * speed, 1000); // 最少说1秒
+    setPhonemeTimeline(phonemes);
+    phonemeStartTime = audioStartTime || Date.now();
+
+    // 如果没有 phoneme 数据，回退到旧模式
+    if (phonemeTimeline.length === 0) {
+      startSpeakingLegacy();
+      return;
+    }
+
+    const animate = () => {
+      if (!isSpeaking || !model.value) return;
+
+      const now = Date.now();
+      const elapsedSec = (now - phonemeStartTime) / 1000;
+
+      // 找到当前应该播放的音素
+      let activePhoneme: PhonemeInfo | null = null;
+      let nextPhoneme: PhonemeInfo | null = null;
+
+      for (let i = 0; i < phonemeTimeline.length; i++) {
+        const p = phonemeTimeline[i];
+        if (elapsedSec >= p.startTime && elapsedSec < p.endTime) {
+          activePhoneme = p;
+          nextPhoneme = phonemeTimeline[i + 1] || null;
+          currentPhonemeIndex = i;
+          break;
+        }
+        if (elapsedSec < p.startTime) {
+          nextPhoneme = p;
+          break;
+        }
+      }
+
+      // 如果已经过了最后一个音素，停止
+      if (!activePhoneme && elapsedSec > (phonemeTimeline[phonemeTimeline.length - 1]?.endTime || 0)) {
+        stopSpeaking();
+        return;
+      }
+
+      // 计算口型参数
+      let targetOpen = 0;
+      let targetForm = 0;
+
+      if (activePhoneme) {
+        const shape = getMouthShape(activePhoneme.phoneme);
+        const phonemeDuration = activePhoneme.endTime - activePhoneme.startTime;
+        const phonemeProgress = phonemeDuration > 0
+          ? (elapsedSec - activePhoneme.startTime) / phonemeDuration
+          : 0;
+
+        // 在音素内部做平滑过渡：开头和结尾稍微闭合，中间最开
+        // 使用正弦曲线让过渡更自然
+        const envelope = Math.sin(phonemeProgress * Math.PI);
+        targetOpen = shape.open * (0.3 + 0.7 * envelope);
+        targetForm = shape.form;
+
+        // 如果有下一个音素，做插值过渡
+        if (nextPhoneme && phonemeProgress > 0.7) {
+          const nextShape = getMouthShape(nextPhoneme.phoneme);
+          const blend = (phonemeProgress - 0.7) / 0.3; // 0~1
+          targetOpen = targetOpen * (1 - blend) + nextShape.open * blend;
+          targetForm = targetForm * (1 - blend) + nextShape.form * blend;
+        }
+      } else if (nextPhoneme) {
+        // 等待下一个音素，保持微开
+        targetOpen = 0.1;
+        targetForm = 0;
+      }
+
+      // 应用口型参数
+      setParam('ParamMouthOpenY', Math.max(0, Math.min(1, targetOpen)));
+      setParam('ParamMouthForm', Math.max(-1, Math.min(1, targetForm)));
+
+      mouthAnimationId = requestAnimationFrame(animate);
+    };
+
+    mouthAnimationId = requestAnimationFrame(animate);
+  }
+
+  // 旧版口型动画（无 phoneme 数据时的回退方案）
+  function startSpeaking(text?: string, durationMs?: number, speed: number = 150) {
+    if (!model.value) return;
+    // 如果正在说话，先停止
+    if (isSpeaking) {
+      stopSpeaking();
+    }
+    isSpeaking = true;
+
+    startSpeakingLegacy(text, durationMs, speed);
+  }
+
+  function startSpeakingLegacy(text?: string, durationMs?: number, speed: number = 150) {
+    const duration = durationMs || Math.max((text?.length || 0) * speed, 1000);
     const startTime = Date.now();
 
     const animate = () => {
@@ -286,11 +469,12 @@ export function useLive2D() {
 
       // 模拟口型开合：使用正弦波 + 随机扰动
       const progress = elapsed / duration;
-      const baseOpen = Math.sin(progress * Math.PI * 10) * 0.5 + 0.5; // 0~1
+      const baseOpen = Math.sin(progress * Math.PI * 10) * 0.5 + 0.5;
       const randomOpen = Math.random() * 0.3;
       const mouthOpen = Math.min(1, baseOpen + randomOpen);
 
       setParam('ParamMouthOpenY', mouthOpen);
+      setParam('ParamMouthForm', 0);
 
       mouthAnimationId = requestAnimationFrame(animate);
     };
@@ -300,11 +484,14 @@ export function useLive2D() {
 
   function stopSpeaking() {
     isSpeaking = false;
+    phonemeTimeline = [];
+    currentPhonemeIndex = 0;
     if (mouthAnimationId !== null) {
       cancelAnimationFrame(mouthAnimationId);
       mouthAnimationId = null;
     }
-    setParam('ParamMouthOpenY', 0); // 闭嘴
+    setParam('ParamMouthOpenY', 0);
+    setParam('ParamMouthForm', 0);
   }
 
   // AI 情绪映射到表情和动作
@@ -329,9 +516,16 @@ export function useLive2D() {
   }
 
   // AI 说话接口 - 外部调用
-  function speak(text: string, emotion?: string) {
+  // text: 说话文本, emotion: 情绪, durationMs: 音频时长（如果有音频播放）
+  function speak(text?: string, emotion?: string, durationMs?: number) {
     if (emotion) applyEmotion(emotion);
-    startSpeaking(text);
+    startSpeaking(text, durationMs);
+  }
+
+  // 带 phoneme 时间轴的说话接口
+  function speakWithPhonemes(phonemes: PhonemeInfo[], emotion?: string, audioStartTime?: number) {
+    if (emotion) applyEmotion(emotion);
+    startSpeakingWithPhonemes(phonemes, audioStartTime);
   }
 
   function destroy() {
@@ -357,6 +551,7 @@ export function useLive2D() {
     setExpression,
     clearExpression,
     speak,
+    speakWithPhonemes,
     applyEmotion,
     startSpeaking,
     stopSpeaking,
