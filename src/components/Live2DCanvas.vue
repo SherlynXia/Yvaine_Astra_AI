@@ -16,7 +16,8 @@
       :is-connecting="isConnecting"
       :is-typing="isTyping"
       @send="handleChatSend"
-      @test-t-t-s="handleTestTTS"
+      @test-tts="handleTestTTS"
+      @feedback="sendFeedback"
     />
     <div class="hint">点击模型触发动作，鼠标移动控制视线</div>
   </div>
@@ -50,7 +51,7 @@ const {
 } = useLive2D();
 
 // 聊天功能 - Yvaine 说话时触发口型和表情
-const { history: chatHistory, isConnected, isConnecting, isTyping, isPlaying, send: sendChat } = useChat(
+const { history: chatHistory, isConnected, isConnecting, isTyping, isPlaying, send: sendChat, sendFeedback } = useChat(
   // onYvaineSpeak - 收到文本时触发（只应用情绪表情，不启动口型）
   (text: string, emotion?: string) => {
     // 文本到达时只应用情绪表情

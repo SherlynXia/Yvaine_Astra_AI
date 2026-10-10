@@ -20,18 +20,24 @@ VOLCANO_VOICE = os.getenv("VOLCANO_VOICE_TYPE", "zh_female_wanwanxiaohe_moon_big
 
 # TTS 模式: http / websocket / bidi (双向流式，支持 phoneme 时间戳)
 TTS_MODE = os.getenv("TTS_MODE", "bidi").lower()
-
-DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 USE_OLLAMA = os.getenv("USE_OLLAMA", "false").lower() == "true"
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
 # ========== 日志 ==========
 def log(msg: str):
     print(msg, flush=True)
 
-# ========== TTS 服务 ==========
+# ========== 服务导入 ==========
 from services.tts_ws_service import TTSWebSocketService
 from services.tts_bidi_service import TTSBidirectionalService, TTSResult
+from services.chat_service import ChatService
+from services.llm import OllamaProvider, DeepSeekProvider
+from feedback_manager import save_feedback, get_feedback_stats
+
+# ========== 待评分消息缓存 ==========
+pending_feedback: dict[str, dict] = {}
+_MAX_PENDING = 100  # 最多缓存 100 条未评分消息
 
 class TTSService:
     @staticmethod
@@ -134,74 +140,7 @@ class TTSService:
 
         return "".join(audio_chunks)
 
-# ========== Chat 服务 ==========
-class ChatService:
-    @staticmethod
-    async def chat(user_msg: str) -> tuple:
-        system = """你是 Yvaine（伊文），一个温柔、聪明、略带调皮的 AI 女孩。
-说话温柔，偶尔撒娇，喜欢用「呢」「呀」「~」。
-回复末尾用 [情绪:xxx] 标注情绪，可选：开心、害羞、生气、难过、惊讶、疑惑、调皮、困倦"""
-        
-        if USE_OLLAMA:
-            return await ChatService._ollama_chat(system, user_msg)
-        elif DEEPSEEK_KEY:
-            return await ChatService._deepseek_chat(system, user_msg)
-        else:
-            return "抱歉，我的大脑暂时离线了...", "难过"
-    
-    @staticmethod
-    async def _ollama_chat(system: str, user_msg: str) -> tuple:
-        import httpx
-        try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post("http://127.0.0.1:11434/api/generate", json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": f"{system}\n\n用户：{user_msg}\nYvaine：",
-                    "stream": False,
-                    "options": {"temperature": 0.8, "num_predict": 500},
-                })
-                data = resp.json()
-                content = data.get("response", "嗯...").strip()
-                return ChatService._parse_emotion(content)
-        except Exception as e:
-            log(f"[Chat] Ollama 错误: {e}")
-            return "哎呀，我的思绪有点乱...", "疑惑"
-    
-    @staticmethod
-    async def _deepseek_chat(system: str, user_msg: str) -> tuple:
-        import httpx
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post("https://api.deepseek.com/v1/chat/completions", headers={
-                    "Authorization": f"Bearer {DEEPSEEK_KEY}",
-                    "Content-Type": "application/json",
-                }, json={
-                    "model": "deepseek-chat",
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    "temperature": 0.8,
-                    "max_tokens": 500,
-                })
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                return ChatService._parse_emotion(content)
-        except Exception as e:
-            log(f"[Chat] DeepSeek 错误: {e}")
-            return "哎呀，我的思绪有点乱...", "疑惑"
-    
-    @staticmethod
-    def _parse_emotion(text: str) -> tuple:
-        emotion = "开心"
-        if "[情绪:" in text or "[情绪：" in text:
-            text = text.replace("[情绪：", "[情绪:")
-            start = text.rfind("[情绪:") + 4
-            end = text.rfind("]", start)
-            if end > start:
-                emotion = text[start:end].strip()
-                text = text[:text.rfind("[情绪:")].strip()
-        return text, emotion
+
 
 # ========== FastAPI 应用 ==========
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -233,49 +172,93 @@ async def test_tts_emotion():
         results[emotion] = {"status": "ok" if audio else "error", "length": len(audio) if audio else 0}
     return {"mode": TTS_MODE, "results": results}
 
+@app.get("/feedback/stats")
+async def feedback_stats():
+    """反馈统计"""
+    return get_feedback_stats()
+
 @app.websocket("/ws/chat")
 async def ws_chat(ws: WebSocket):
     await ws.accept()
-    log("✨ WebSocket 连接建立")
-    
+    session_id = str(uuid.uuid4())
+    log(f"✨ WebSocket 连接建立 | 会话: {session_id[:8]}...")
+
     try:
         while True:
             data = await ws.receive_text()
             msg = json.loads(data)
+
+            # ---------- 分支 1：评分消息 ----------
+            if msg.get("type") == "feedback":
+                message_id = msg.get("messageId", "")
+                rating = msg.get("rating", "")
+                if message_id and rating in ("good", "bad"):
+                    context = pending_feedback.pop(message_id, None)
+                    if context:
+                        ok = save_feedback(context, rating)
+                        log(f"[Feedback] {'✅' if ok else '❌'} {rating}: {message_id[:8]}")
+                        await ws.send_json({
+                            "type": "feedback_ack",
+                            "status": "ok" if ok else "save_failed",
+                            "messageId": message_id,
+                        })
+                    else:
+                        log(f"[Feedback] ⚠️ 未找到消息: {message_id[:8]}")
+                        await ws.send_json({
+                            "type": "feedback_ack",
+                            "status": "not_found",
+                            "messageId": message_id,
+                        })
+                continue  # 评分消息处理完，不走聊天流程
+
+            # ---------- 分支 2：普通聊天消息 ----------
             user_text = msg.get("text", "").strip()
             if not user_text:
                 continue
-            
+
             log(f"[User] {user_text}")
-            
+
             # 获取回复
-            reply, emotion = await ChatService.chat(user_text)
-            log(f"[Yvaine] {reply[:50]}...")
-            
-            # 发送文本
-            await ws.send_json({"type": "message", "text": reply, "emotion": emotion})
-            
-            # TTS - 根据情绪映射到语音情感参数
+            reply, emotion, sid = await ChatService.chat(user_text, session_id)
+            log(f"[渊鸢] {reply[:50]}... | 情绪: {emotion}")
+
+            # 情绪映射
             emotion_map = {
-                "开心": "happy",
-                "害羞": "neutral",
-                "生气": "angry",
-                "难过": "sad",
-                "惊讶": "surprised",
-                "疑惑": "neutral",
-                "调皮": "happy",
-                "困倦": "neutral",
+                "开心": "happy", "温柔": "neutral", "傲娇": "neutral",
+                "冷静": "neutral", "担忧": "sad", "困倦": "neutral",
+                "好奇": "surprised", "欣慰": "happy", "无奈": "sad",
+                "生气": "angry", "难过": "sad", "惊讶": "surprised",
+                "疑惑": "neutral", "调皮": "happy",
             }
             tts_emotion = emotion_map.get(emotion, "")
 
-            # 使用新接口获取音频 + phoneme 时间轴
+            # 生成消息 ID 并缓存上下文（用于后续评分）
+            message_id = str(uuid.uuid4())
+            pending_feedback[message_id] = {
+                "message_id": message_id,
+                "session_id": session_id,
+                "user_message": user_text,
+                "ai_reply": reply,
+                "emotion": emotion,
+                "tts_emotion": tts_emotion,
+            }
+            if len(pending_feedback) > _MAX_PENDING:
+                oldest = next(iter(pending_feedback))
+                del pending_feedback[oldest]
+
+            # 发送文本（带 messageId）
+            await ws.send_json({
+                "type": "message",
+                "text": reply,
+                "emotion": emotion,
+                "sessionId": sid,
+                "messageId": message_id,   # 🔥 前端拿到后用于评分
+            })
+
+            # TTS
             tts_result = await TTSService.synthesize_with_phonemes(reply, emotion=tts_emotion)
-
             if tts_result.audio_base64:
-                # 发送音频
                 await ws.send_json({"type": "audio", "audioBase64": tts_result.audio_base64})
-
-                # 如果有 phoneme 数据，一并发送给前端用于精确口型同步
                 if tts_result.phonemes:
                     await ws.send_json({
                         "type": "phonemes",
@@ -288,25 +271,52 @@ async def ws_chat(ws: WebSocket):
                     log(f"🎵 音频已发送 (情感: {tts_emotion or '默认'})")
             else:
                 log("⚠️ TTS 失败")
-    
+
     except WebSocketDisconnect:
-        log("💫 WebSocket 断开")
+        log(f"💫 WebSocket 断开 | 会话: {session_id[:8]}...")
+        if session_id in ChatService.conversations:
+            del ChatService.conversations[session_id]
     except Exception as e:
         log(f"❌ WebSocket 错误: {e}")
+        if session_id in ChatService.conversations:
+            del ChatService.conversations[session_id]
+
 
 # ========== 启动 ==========
 if __name__ == "__main__":
     try:
         import uvicorn
 
-        # 初始化 TTS 服务
+        # 1. 初始化 TTS
         asyncio.run(TTSService.initialize())
+
+        # 2. 选择并配置 LLM Provider
+        if USE_OLLAMA:
+            _provider = OllamaProvider(model=OLLAMA_MODEL)
+        elif DEEPSEEK_KEY:
+            _provider = DeepSeekProvider(api_key=DEEPSEEK_KEY)
+        else:
+            _provider = None
+            log("⚠️ 未配置任何 LLM（USE_OLLAMA=false 且 DEEPSEEK_API_KEY 为空）")
+
+        # 3. 加载人格设定
+        _personality_path = Path(__file__).parent / "personality" / "system_prompt.txt"
+        try:
+            _system_prompt = _personality_path.read_text(encoding="utf-8")
+            log(f"[Chat] ✅ 已加载人格设定: {_personality_path}")
+        except Exception as e:
+            log(f"[Chat] ⚠️ 人格设定加载失败: {e}")
+            _system_prompt = "你是渊鸢（Yvaine Astra），一个理性而温柔的 AI 旅伴。回复末尾用 [情绪:冷静] 标注情绪。"
+
+        # 4. 注入 ChatService
+        ChatService.configure(provider=_provider, system_prompt=_system_prompt)
 
         log(f"🚀 启动 Yvaine 后端服务 {HOST}:{PORT}")
         log(f"   环境变量 PYTHON_PORT={os.getenv('PYTHON_PORT', '未设置')}")
         log(f"   工作目录: {os.getcwd()}")
         log(f"   TTS 模式: {TTS_MODE}")
         uvicorn.run("main:app", host=HOST, port=PORT, reload=False)
+
     except KeyboardInterrupt:
         log("\n👋 收到退出信号，正在清理...")
         if TTS_MODE == "bidi":

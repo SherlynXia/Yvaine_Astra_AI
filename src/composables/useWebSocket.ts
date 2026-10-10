@@ -15,13 +15,16 @@ export interface WordInfo {
 }
 
 export interface ChatMessage {
-  type: 'message' | 'audio' | 'phonemes' | 'error';
+  type: 'message' | 'audio' | 'phonemes' | 'error' | 'feedback_ack';
   text?: string;
   emotion?: string;
   audioBase64?: string;
   phonemes?: PhonemeInfo[];
   words?: WordInfo[];
   durationMs?: number;
+  sessionId?: string;  // 会话ID
+  messageId?: string;
+  status?: string;
 }
 
 export function useWebSocket() {
@@ -33,6 +36,19 @@ export function useWebSocket() {
   const wsUrl = ref<string>('');
   // 消息队列，用于处理短时间内连续到达的消息
   const messageQueue = ref<ChatMessage[]>([]);
+
+  const sendFeedback = (messageId: string, rating: 'good' | 'bad'): boolean => {
+    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
+      console.warn('[Feedback] WebSocket 未连接');
+      return false;
+    }
+    ws.value.send(JSON.stringify({
+      type: 'feedback',
+      messageId,
+      rating,
+    }));
+    return true;
+  };
 
   async function getWebSocketUrl(): Promise<string> {
     // 尝试通过 Tauri Rust 后端获取 Python 服务的 WebSocket 地址
@@ -144,5 +160,6 @@ export function useWebSocket() {
     connect,
     disconnect,
     sendMessage,
+    sendFeedback,
   };
 }

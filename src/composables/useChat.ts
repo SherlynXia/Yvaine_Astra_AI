@@ -7,6 +7,8 @@ export interface ChatHistoryItem {
   role: 'user' | 'yvaine';
   text: string;
   emotion?: string;
+  messageId?: string;
+  feedback?: 'good' | 'bad' | null;
 }
 
 export function useChat(
@@ -14,8 +16,7 @@ export function useChat(
   onAudioPlay?: (duration: number) => void,
   onPhonemes?: (phonemes: PhonemeInfo[], emotion?: string, audioStartTime?: number) => void
 ) {
-  const { connect, disconnect, sendMessage, isConnected, isConnecting, lastMessage, messageQueue, error } = useWebSocket();
-
+  const { connect, disconnect, sendMessage, sendFeedback: wsSendFeedback, isConnected, isConnecting, lastMessage, messageQueue, error } = useWebSocket();
   const history = ref<ChatHistoryItem[]>([]);
   const isTyping = ref(false);
   const isPlaying = ref(false);
@@ -181,6 +182,8 @@ export function useChat(
             role: 'yvaine',
             text: msg.text,
             emotion: msg.emotion,
+            messageId: msg.messageId,   // s保存 messageId
+            feedback: null,             // 初始未评分
           });
 
           // 触发 Yvaine 说话（口型 + 表情）
@@ -203,6 +206,13 @@ export function useChat(
             onPhonemes(pendingPhonemes, pendingEmotion, currentAudioStartTime);
             pendingPhonemes = null;
             pendingEmotion = undefined;
+          }
+        } else if (msg.type === 'feedback_ack') {
+          console.log(`[Feedback] ${msg.status}: ${msg.messageId}`);
+          if (msg.status !== 'ok') {
+            // 保存失败，回滚本地状态
+            const item = history.value.find(h => h.messageId === msg.messageId);
+            if (item) item.feedback = null;
           }
         } else if (msg.type === 'error') {
           // 后端报错（如 TTS 失败）
@@ -248,6 +258,17 @@ export function useChat(
     }
   }
 
+  function sendFeedback(messageId: string, rating: 'good' | 'bad') {
+    // 本地先乐观更新
+    const item = history.value.find(h => h.messageId === messageId);
+    if (!item || item.feedback !== null) return;  // 已经评过就跳过
+
+    const ok = wsSendFeedback(messageId, rating);
+    if (ok) {
+      item.feedback = rating;
+    }
+  }
+
   return {
     history,
     isConnected,
@@ -260,5 +281,6 @@ export function useChat(
     connect,
     disconnect,
     stopAudio,
+    sendFeedback,
   };
 }

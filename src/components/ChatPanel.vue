@@ -22,9 +22,31 @@
         <template v-for="(msg, index) in history" :key="index">
           <div class="message" :class="msg.role">
             <div class="avatar">{{ msg.role === 'user' ? '👤' : '✨' }}</div>
-            <div class="bubble">
-              <div class="text">{{ msg.text }}</div>
-              <div v-if="msg.emotion" class="emotion-tag">{{ msg.emotion }}</div>
+            <div class="bubble-wrapper">
+              <div class="bubble">
+                <div class="text">{{ msg.text }}</div>
+                <div v-if="msg.emotion" class="emotion-tag">{{ msg.emotion }}</div>
+              </div>
+              <!-- 🔥 评分按钮（只对 AI 消息显示） -->
+              <div
+                v-if="msg.role === 'yvaine' && msg.messageId"
+                class="feedback-buttons"
+              >
+                <button
+                  class="fb-btn"
+                  :class="{ active: msg.feedback === 'good' }"
+                  :disabled="msg.feedback === 'good' || msg.feedback === 'bad'"
+                  @click="emit('feedback', msg.messageId!, 'good')"
+                  title="回答不错"
+                >👍</button>
+                <button
+                  class="fb-btn"
+                  :class="{ active: msg.feedback === 'bad' }"
+                  :disabled="msg.feedback === 'good' || msg.feedback === 'bad'"
+                  @click="emit('feedback', msg.messageId!, 'bad')"
+                  title="回答不好"
+                >👎</button>
+              </div>
             </div>
           </div>
         </template>
@@ -71,7 +93,13 @@
 import { ref, computed } from 'vue';
 
 const props = defineProps<{
-  history: { role: 'user' | 'yvaine'; text: string; emotion?: string }[];
+  history: {
+    role: 'user' | 'yvaine';
+    text: string;
+    emotion?: string;
+    messageId?: string;
+    feedback?: 'good' | 'bad' | null;
+  }[];
   isConnected: boolean;
   isConnecting: boolean;
   isTyping: boolean;
@@ -80,6 +108,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   send: [text: string];
   testTTS: [];
+  feedback: [messageId: string, rating: 'good' | 'bad'];
 }>();
 
 const isExpanded = ref(true);
@@ -231,8 +260,18 @@ function testTTS() {
   flex-shrink: 0;
 }
 
-.bubble {
+/* 🔥 新增：气泡和评分按钮的容器 */
+.bubble-wrapper {
+  display: flex;
+  flex-direction: column;
   max-width: 240px;
+}
+
+.message.user .bubble-wrapper {
+  align-items: flex-end;
+}
+
+.bubble {
   padding: 10px 14px;
   border-radius: 14px;
   font-size: 14px;
@@ -369,5 +408,52 @@ function testTTS() {
 .message-list::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.1);
   border-radius: 2px;
+}
+
+/* 🔥 评分按钮 */
+.feedback-buttons {
+  display: flex;
+  gap: 4px;
+  margin-top: 3px;
+  padding-left: 4px;
+}
+
+.message.user .feedback-buttons {
+  justify-content: flex-end;
+  padding-right: 4px;
+}
+
+.fb-btn {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  padding: 1px 7px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.4;
+  opacity: 0.4;
+  transition: all 0.2s ease;
+}
+
+.fb-btn:hover:not(:disabled) {
+  opacity: 1;
+  border-color: rgba(255, 255, 255, 0.5);
+  transform: scale(1.05);
+}
+
+.fb-btn.active {
+  opacity: 1;
+  background: rgba(100, 200, 255, 0.2);
+  border-color: rgba(100, 200, 255, 0.6);
+  box-shadow: 0 0 6px rgba(100, 200, 255, 0.3);
+}
+
+.fb-btn:disabled {
+  cursor: default;
+  opacity: 0.25;
+}
+
+.fb-btn.active:disabled {
+  opacity: 1;
 }
 </style>
