@@ -12,8 +12,9 @@
 | 前端框架 | Vue 3 + TypeScript + Vite |
 | 图形渲染 | PixiJS 6 + pixi-live2d-display (Cubism 4) |
 | 后端框架 | Python FastAPI + Uvicorn |
-| LLM 对话 | DeepSeek API / 本地 Ollama |
-| TTS 语音 | 火山引擎豆包语音合成 2.0 (HTTP V3 / WebSocket / 双向流式) |
+| LLM 对话 | DeepSeek API（默认 `deepseek-flash`）/ 本地 Ollama，流式输出 |
+| TTS 语音 | 火山引擎豆包语音合成 2.0（双向流式 + phoneme） |
+| 记忆系统 | SQLite + ChromaDB（bge-small-zh-v1.5） |
 
 ---
 
@@ -21,31 +22,41 @@
 
 ```
 Yvaine_Astra_AI/
-├── backend/                        # Python 后端
-│   ├── main.py                     # FastAPI 入口，WebSocket 服务
-│   ├── feedback_manager.py         # 反馈管理器（写入 data/feedback.jsonl）
+├── backend/
+│   ├── main.py                     # FastAPI 入口（已瘦身）
 │   ├── requirements.txt
 │   ├── .env / .env.example
+│   ├── core/
+│   │   ├── chat_service.py         # 编排层：记忆 + LLM + 情绪 + 动作
+│   │   └── action_parser.py        # 流式剥离 () 中的动作描写
+│   ├── llm/                        # 🤖 LLM 层
+│   │   ├── base.py                 # LLMProvider 接口（含 chat_stream）
+│   │   ├── ollama_provider.py
+│   │   └── deepseek_provider.py
+│   ├── tts/                        # 🔊 TTS 层
+│   │   ├── facade.py               # TTSService 门面
+│   │   ├── http.py                 # HTTP V3
+│   │   ├── websocket.py            # WS 单向流式
+│   │   └── bidi.py                 # 双向流式（phoneme）
+│   ├── memory/                     # 🧬 记忆层
+│   │   ├── short_term.py           # ConversationStore
+│   │   ├── database.py             # SQLite
+│   │   ├── vector_store.py         # ChromaDB
+│   │   ├── extractor.py            # 记忆提取
+│   │   ├── retriever.py            # 记忆检索
+│   │   └── user_manager.py         # 用户 + 声纹接口占位
+│   ├── feedback/                   # 📊 反馈层
+│   │   └── manager.py
 │   ├── personality/
-│   │   └── system_prompt.txt       # 人格设定（渊鸢）
-│   ├── data/                       # 📊 运行时数据（不提交 Git）
-│   │   ├── .gitkeep
-│   │   ├── feedback.jsonl          # 用户评分
-│   │   ├── conversations/          # 精选对话（预留）
-│   │   └── memories/               # 长期记忆（预留）
-│   ├── training/                   # 🧪 训练流水线（占位）
-│   │   └── README.md
-│   └── services/
-│       ├── __init__.py
-│       ├── chat_service.py         # 对话服务（注入 Provider）
-│       ├── llm/                    # 🔥 LLM 抽象层
-│       │   ├── __init__.py
-│       │   ├── base.py             # LLMProvider 接口
-│       │   ├── ollama_provider.py
-│       │   └── deepseek_provider.py
-│       ├── tts_service.py
-│       ├── tts_ws_service.py
-│       └── tts_bidi_service.py
+│   │   └── system_prompt.txt
+│   ├── data/
+│   │   ├── feedback.jsonl
+│   │   ├── memory.db               # SQLite（不提交）
+│   │   ├── chroma/                 # 向量库（不提交）
+│   │   ├── conversations/
+│   │   └── memories/
+│   └── training/
+│       └── README.md
 ├── src/                            # Vue 前端
 │   ├── main.ts                     # 应用入口
 │   ├── App.vue                     # 根组件
@@ -150,7 +161,14 @@ Live2D 动作触发面板，提供：
 ```typescript
 PhonemeInfo { phoneme, startTime, endTime, confidence }
 WordInfo { word, startTime, endTime, confidence }
-ChatMessage { type, text?, emotion?, audioBase64?, phonemes?, words?, durationMs?, sessionId? }
+ChatMessage {
+  type: 'message' | 'audio' | 'phonemes' | 'error' | 'feedback_ack'
+  text?, emotion?, audioBase64?, phonemes?, words?, durationMs?,
+  sessionId?, messageId?, status?,
+  actions?: string[]           // 动作 tag 列表
+  sequenceIndex?: number       // 音频片段序号
+  isLastChunk?: boolean        // 是否最后一段音频
+}
 ```
 
 **导出函数：** `useWebSocket()`
@@ -177,7 +195,8 @@ ChatMessage { type, text?, emotion?, audioBase64?, phonemes?, words?, durationMs
 |------|------|------|
 | `onYvaineSpeak` | `(text, emotion?) => void` | AI 回复文本到达时的回调 |
 | `onAudioPlay` | `(duration) => void` | 音频播放时的回调（回退口型） |
-| `onPhonemes` | `(phonemes, emotion?, audioStartTime?) => void` | phoneme 时间轴数据到达回调 |
+| `onPhonemes` | `(phonemes, emotion?, audioStartTime?) => void` | 音素时间轴数据到达，触发精确口型同步 |
+| `onActions` | `(actions: string[]) => void` | 动作 tag 到达回调（如 `tilt_head`、`wave`） |
 
 | 返回值 | 类型 | 说明 |
 |--------|------|------|
@@ -194,7 +213,10 @@ ChatMessage { type, text?, emotion?, audioBase64?, phonemes?, words?, durationMs
 | `stopAudio()` | `() => void` | 停止音频播放 |
 | `sendFeedback(messageId, rating)` | `(id: string, r: 'good' \| 'bad') => void` | 提交评分 |
 
-**内部函数：** `playAudio(base64Data: string)` — 解码并播放 base64 音频
+**内部函数：**
+- `decodeBase64Audio()` — base64 → Blob → Audio
+- `enqueueAudio()` — 音频片段入队
+- `playQueue()` — 顺序播放队列，每段 `playing` 时触发 phoneme 口型
 
 #### `useLive2D.ts` — Live2D 模型控制
 管理 Live2D 模型的加载、渲染、表情、动作、口型动画。
@@ -220,10 +242,12 @@ ChatMessage { type, text?, emotion?, audioBase64?, phonemes?, words?, durationMs
 | `applyEmotion(emotion)` | `(emotion: string) => void` | 根据情绪标签应用表情和动作 |
 | `startSpeaking(text?, durationMs?, speed?)` | `(text?, durationMs?, speed?) => void` | 开始说话动画 |
 | `stopSpeaking()` | `() => void` | 停止说话动画 |
+| `setParam(id, value)` | `(id: string, v: number) => void` | 直接设置模型参数（供动作映射用） |
+| `mouseFollowEnabled` | `Ref<boolean>` | 鼠标跟随开关状态 |
+| `setMouseFollow(enabled)` | `(enabled: boolean) => void` | 切换鼠标跟随，关闭时归零注视参数 |
 | `destroy()` | `() => void` | 销毁模型和应用实例 |
 
 **内部函数：**
-- `setParam(id, value)` — 直接设置 Live2D 模型参数
 - `getMouthShape(phoneme)` — 音素到口型参数映射
 - `setPhonemeTimeline(phonemes)` — 设置音素时间轴
 - `startSpeakingWithPhonemes(phonemes, audioStartTime?)` — 基于音素时间轴的精确口型同步
@@ -262,21 +286,11 @@ ChatMessage { type, text?, emotion?, audioBase64?, phonemes?, words?, durationMs
 
 ## 后端模块说明
 
-### 1. `main.py` — FastAPI 服务入口
+### 1. `main.py` — FastAPI 入口
 
-**全局配置：**
-- 从 `.env` 加载火山引擎 TTS 配置
-- TTS 模式可选：`http` / `websocket` / `bidi`（双向流式）
-- `ChatService`、`ConversationStore` 等对话相关逻辑统一从 `services/chat_service.py` 导入
+**职责**：只做三件事——创建 app、注册路由、启动服务。业务逻辑全部下沉到各域。
 
-**`TTSService` 方法（main.py 内唯一自定义的类）：**
-
-| 方法 | 签名 | 说明 |
-|------|------|------|
-| `initialize()` | `async` static | 初始化 TTS 服务 |
-| `synthesize(text, emotion)` | `async static` → `str` | 文本转语音，返回 base64 音频（兼容旧接口） |
-| `synthesize_with_phonemes(text, emotion)` | `async static` → `TTSResult` | 文本转语音，返回音频 + 音素时间轴（新接口） |
-| `_http_synthesize(text, emotion)` | `async static` → `str` | HTTP V3 备用合成方案 |
+**从 `.env` 读取**：`PORT`、`HOST`、`USE_OLLAMA`、`OLLAMA_MODEL`、`DEEPSEEK_API_KEY`
 
 **FastAPI 路由：**
 
@@ -285,127 +299,88 @@ ChatMessage { type, text?, emotion?, audioBase64?, phonemes?, words?, durationMs
 | `/` | GET | 服务状态检查 |
 | `/health` | GET | 健康检查 |
 | `/test-tts` | GET | TTS 合成测试 |
-| `/test-tts-emotion` | GET | 带情感的 TTS 合成测试（happy/sad/angry/surprised） |
-| `/feedback/stats` | GET | 反馈统计（total/good/bad） |
-| `/ws/chat` | WebSocket | 聊天 WebSocket 连接（核心通信通道） |
+| `/test-tts-emotion` | GET | 带情感 TTS 测试 |
+| `/feedback/stats` | GET | 反馈统计 |
+| `/ws/chat` | WebSocket | 聊天通道（流式 + 句子切分 + TTS） |
 
 **WebSocket 消息格式：**
-- 客户端 → 服务端（聊天）：`{"text": "用户消息"}`
+
+- 客户端 → 服务端（聊天）：`{"text": "..."}`
 - 客户端 → 服务端（评分）：`{"type": "feedback", "messageId": "xxx", "rating": "good"}`
-- 服务端 → 客户端（文本）：`{"type": "message", "text": "...", "emotion": "...", "sessionId": "...", "messageId": "xxx"}`
-- 服务端 → 客户端（评分确认）：`{"type": "feedback_ack", "status": "ok", "messageId": "xxx"}`
-- 服务端 → 客户端（音频）：`{"type": "audio", "audioBase64": "..."}`
-- 服务端 → 客户端（音素）：`{"type": "phonemes", "phonemes": [...], "words": [...], "durationMs": 1234}`
+- 服务端 → 客户端（文本）：
+  ```json
+  {"type": "message", "text": "...", "emotion": "...", "actions": ["tilt_head"], "sessionId": "...", "messageId": "..."}
+- 服务端 → 客户端（评分确认）：`{"type": "feedback_ack", "status": "ok", "messageId": "..."}`
+- 服务端 → 客户端（音频片段）：`{"type": "audio", "audioBase64": "...", "phonemes": [...], "sequenceIndex": 0, "isLastChunk": false}`
 
 ---
 
-### 2. Services
+### 2. Core（编排层）
 
-#### `chat_service.py` — 对话服务（Provider 模式）
+#### `core/chat_service.py`
+- `ChatService.configure(provider, system_prompt)` — 注入 LLM 和人格
+- `ChatService.chat_stream(user_message, session_id)` — 流式对话，串联：记忆检索 → 注入 Prompt → LLM 流式 → 动作/对白分离 → 情绪解析 → 记忆提取
+- `ChatService.clear_session(session_id)`
 
-包含 `ConversationStore` 和 `ChatService`。`ChatService` 不再自己读 `.env`，而是由 `main.py` 注入一个 `LLMProvider`。
+#### `core/action_parser.py`
+- `ActionParser` — 流式状态机，支持括号跨 chunk 切分
+- `feed(chunk)` → `(干净对白, 动作列表)`
+- `flush()` — 收尾，丢弃未闭合括号
+- `map_action_to_live2d(text)` — 动作文本 → 前端 tag
 
-**`ChatService` 方法：**
+### 3. LLM 层
 
-| 方法 | 签名 | 说明 |
-|------|------|------|
-| `configure(provider, system_prompt)` | `classmethod` | 由 `main.py` 调用，注入 Provider 和人格 |
-| `chat(user_message, session_id)` | `async classmethod` → `(str, str, str)` | 多轮对话 |
-| `_parse_emotion(text)` | `static` → `(str, str)` | 解析 `[情绪:xxx]` 标签 |
-| `clear_session(session_id)` | `classmethod` | 清理指定会话 |
+| 文件 | 说明 |
+|------|------|
+| `llm/base.py` | `LLMProvider` 接口，含 `chat()` 和 `chat_stream()` |
+| `llm/ollama_provider.py` | 本地 Ollama，优先 `/api/chat` 流式，回退 `/api/generate` |
+| `llm/deepseek_provider.py` | 云端 DeepSeek，SSE 流式 |
 
-**`ChatService` 类：**
+### 4. TTS 层
 
-| 方法 | 签名 | 说明 |
-|------|------|------|
-| `initialize()` | `async` classmethod | 初始化对话服务，加载人格设定、检测 DeepSeek/Ollama |
-| `chat(user_message, session_id)` | `async` classmethod → `(str, str, str)` | 多轮对话，返回 (回复文本, 情绪标签, session_id) |
-| `_chat_with_ollama(messages)` | `async` classmethod → `(str, str)` | 使用 Ollama 模型（先尝试 /api/chat，失败回退 /api/generate） |
-| `_chat_with_deepseek(messages)` | `async` classmethod → `(str, str)` | 使用 DeepSeek API（原生多轮 messages） |
-| `_parse_emotion(text)` | `static` → `(str, str)` | 从回复文本中解析 [情绪:xxx] 标签 |
+| 文件 | 说明 |
+|------|------|
+| `tts/facade.py` | `TTSService` 门面，按 `TTS_MODE` 路由到具体实现 |
+| `tts/http.py` | HTTP V3 单向流式 |
+| `tts/websocket.py` | WebSocket V3 单向流式 |
+| `tts/bidi.py` | 双向流式，返回音频 + phoneme 时间轴 |
 
-#### `tts_service.py` — TTS HTTP 服务
+### 5. Memory 层（新增）
 
-**`TTSService` 类：**
+| 文件 | 说明 |
+|------|------|
+| `memory/short_term.py` | `ConversationStore` — 单会话滑动窗口（10 轮） |
+| `memory/database.py` | SQLite — `users` + `memories` 两张表 |
+| `memory/vector_store.py` | ChromaDB — `BAAI/bge-small-zh-v1.5` 嵌入，cosine 检索 |
+| `memory/extractor.py` | 规则预筛 + LLM 精提取，去重后写入 |
+| `memory/retriever.py` | 语义检索 + 时间衰减 + 重要度加权，拼成 Prompt 段落 |
+| `memory/user_manager.py` | 用户管理，`identify_user()` 当前返回 `default`，声纹接口占位 |
 
-| 方法 | 签名 | 说明 |
-|------|------|------|
-| `initialize()` | `async` classmethod | 初始化 TTS（加载火山引擎配置） |
-| `synthesize(text, emotion)` | `async` classmethod → `str` | HTTP V3 单向流式合成，返回 base64 MP3 |
+### 6. Feedback 层
 
-#### `tts_ws_service.py` — TTS WebSocket 单向流式服务
-
-**`TTSWebSocketService` 类：**
-
-| 方法 | 签名 | 说明 |
-|------|------|------|
-| `initialize()` | `async` classmethod | 初始化 TTS WebSocket 配置 |
-| `synthesize(text, emotion)` | `async` classmethod → `str` | WebSocket V3 单向流式合成，返回 base64 音频 |
-| `_detect_resource_id(voice_type)` | `classmethod` → `str` | 根据音色 ID 推断 resource-id |
-| `_create_wav_header(sample_rate, channels, bits_per_sample, data_size)` | `static` → `bytes` | 生成 44 字节 WAV 文件头 |
-| `_build_frame(payload, message_type)` | `classmethod` → `bytes` | 构建 V3 协议二进制帧 |
-| `_parse_frame(data)` | `classmethod` → `tuple` | 解析 V3 协议二进制帧 |
-| `_extract_json_from_payload(payload)` | `classmethod` → `bytes` | 从 payload 提取纯 JSON |
-| `_synthesize_async(text, emotion)` | `async` classmethod → `str` | 异步合成核心逻辑 |
-
-#### `tts_bidi_service.py` — TTS 双向流式服务
-
-**数据类：**
-
-| 类名 | 字段 | 说明 |
-|------|------|------|
-| `PhonemeInfo` | `phoneme, start_time, end_time, confidence` | 单个音素信息 |
-| `WordInfo` | `word, start_time, end_time, confidence` | 单个字级信息 |
-| `TTSResult` | `audio_base64, phonemes, words, duration_ms` | TTS 合成完整结果 |
-
-**`TTSBidirectionalService` 类：**
-
-| 方法 | 签名 | 说明 |
-|------|------|------|
-| `initialize()` | `async` classmethod | 初始化双向流式 TTS 配置 |
-| `synthesize(text, emotion)` | `async` classmethod → `TTSResult` | 双向流式合成，返回音频 + phoneme 时间轴 |
-| `get_mouth_shape(phoneme)` | `classmethod` → `dict` | 根据音素获取口型参数 {open, form} |
-| `_detect_resource_id(voice_type)` | `classmethod` → `str` | 推断 resource-id |
-| `_parse_subtitle_data(resp, phonemes, words)` | `classmethod` | 解析字幕/时间戳数据 |
-| `_build_frame(payload, event_code, session_id, connection_type)` | `classmethod` → `bytes` | 构建 V3 双向流协议帧 |
-| `_parse_frame(data)` | `classmethod` → `tuple` | 解析 V3 双向流协议帧 |
-| `_extract_json_from_payload(payload)` | `classmethod` → `bytes` | 从 payload 提取纯 JSON |
-| `_create_wav_header(sample_rate, channels, bits_per_sample, data_size)` | `classmethod` → `bytes` | 生成 WAV 文件头 |
-| `close()` | `async` classmethod | 关闭服务 |
-
-**`PHONEME_TO_MOUTH` 字典：** 音素到口型参数映射表，支持中文拼音（a/o/e/i/u/ai/ei/ao/ou/an/en/ang/eng/ong/er 等）和英文音素（aa/ae/ah/eh/ih/iy/uh/uw 等），以及辅音映射。
-
-#### `llm/base.py` — LLMProvider 接口
-
-| 方法 | 签名 | 说明 |
-|------|------|------|
-| `chat(messages)` | `async` → `str` | 输入消息列表，返回纯文本回复 |
-
-#### `llm/ollama_provider.py` — 本地 Ollama
-
-| 方法 | 签名 | 说明 |
-|------|------|------|
-| `__init__(model, host)` | 构造 | 默认 `qwen2.5:7b` |
-| `chat(messages)` | `async` → `str` | 优先 `/api/chat`，失败回退 `/api/generate` |
-
-#### `llm/deepseek_provider.py` — 云端 DeepSeek
-
-| 方法 | 签名 | 说明 |
-|------|------|------|
-| `__init__(api_key, model)` | 构造 | 默认 `deepseek-chat` |
-| `chat(messages)` | `async` → `str` | 调用 `/v1/chat/completions` |
+| 文件 | 说明 |
+|------|------|
+| `feedback/manager.py` | `save_feedback()` / `get_feedback_stats()`，写入 `data/feedback.jsonl` |
 
 ---
 
-### 3. Personality（人格设定）
+### 7. Personality（人格设定）
 
 #### `personality/system_prompt.txt`
-"渊鸢"（Yvaine Astra）的完整人格设定，定义其：
+
+"渊鸢"（Yvaine Astra）的完整人格设定，包含：
+
 - **核心**：观测者型 AI 旅伴，"晚星"定位
 - **立场**：自由、平等、忠诚
 - **性格层次**：深邃理性、含蓄温柔、傲娇笨拙、独立自主
-- **说话风格**：冷静简洁、偶尔诗意、含蓄表达关心
+- **说话风格**：短句、口语、含蓄表达关心
 - **行为准则**：提供建议但不代替决定
+
+**强制输出格式**（文件末尾）：
+
+1. 对白正文
+2. 动作描写（如有肢体动作，用 `()` 包裹）
+3. 情绪标签 `[情绪:xxx]`，13 个可选值
 
 ---
 
@@ -414,11 +389,12 @@ ChatMessage { type, text?, emotion?, audioBase64?, phonemes?, words?, durationMs
 ### 1. 安装依赖
 
 ```bash
-# 前端依赖
-npm install
+# 前端依赖（项目使用 pnpm）
+pnpm install
 
 # Python 后端依赖
-cd backend && pip install -r requirements.txt
+cd backend
+pip install -r requirements.txt
 ```
 
 ### 2. 配置环境变量
@@ -454,20 +430,28 @@ npm run tauri dev
 
 ## 数据流概览
 
+### 对话主链路（流式）
+
+
 ```
-用户输入 → ChatPanel.vue → useChat.send()
-  → useWebSocket.sendMessage() → WebSocket → Python main.py
-  → ChatService.chat() (services/chat_service.py) → DeepSeek/Ollama LLM
-  → TTSService.synthesize_with_phonemes() → 火山引擎 TTS
-  → WebSocket 返回 { message, audio, phonemes }
-  → useChat (消息队列) → playAudio() + onPhonemes()
-  → useLive2D.speakWithPhonemes() → 精确口型同步 + 表情
+用户输入
+→ useChat.send() → WebSocket
+→ core/chat_service.chat_stream()
+├── memory/retriever 检索相关记忆 → 注入 System Prompt
+├── llm 流式生成
+└── 每满一句 → 句子切分
+→ tts/facade 逐句合成音频
+→ WebSocket 推送 message + audio 片段
+→ useChat 音频队列顺序播放
+→ useLive2D.speakWithPhonemes 口型同步
+→ memory/extractor 异步提取记忆（不阻塞）
 ```
+
 
 ### 反馈回路（数据飞轮起点）
 
-用户点击 👍/👎 → ChatPanel.vue emit feedback
-  → useChat.sendFeedback() → WebSocket 发送 {type: "feedback"}
-  → Python main.py → feedback_manager.save_feedback()
+用户点击 👍/👎
+  → WebSocket 发送 `{type: "feedback"}`
+  → feedback/manager.save_feedback()
   → 写入 backend/data/feedback.jsonl
   → 未来：训练专属模型的原始数据

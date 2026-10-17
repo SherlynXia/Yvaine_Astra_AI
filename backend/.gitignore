@@ -8,3 +8,7 @@ venv/
 # 运行时数据（不提交，但保留目录结构）
 data/*
 !data/.gitkeep
+
+.env
+.env.*
+!.env.example

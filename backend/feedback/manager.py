@@ -7,7 +7,7 @@ from datetime import datetime
 import threading
 
 # 数据文件位置
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(__file__).parent.parent / "data"
 FEEDBACK_FILE = DATA_DIR / "feedback.jsonl"
 
 # 确保目录存在

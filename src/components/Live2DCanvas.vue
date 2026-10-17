@@ -10,6 +10,17 @@
       @clear="clearExpression"
     />
     <MotionPanel @play="playMotion" />
+
+    <!-- 🔥 鼠标跟随开关 -->
+    <button
+      class="follow-toggle"
+      :class="{ active: mouseFollowEnabled }"
+      @click="toggleMouseFollow"
+      :title="mouseFollowEnabled ? '关闭视线跟随' : '开启视线跟随'"
+    >
+      {{ mouseFollowEnabled ? '👁️' : '🚫' }}
+    </button>
+
     <ChatPanel
       :history="chatHistory"
       :is-connected="isConnected"
@@ -48,35 +59,66 @@ const {
   speakWithPhonemes,
   applyEmotion,
   destroy,
+  mouseFollowEnabled,   // 🔥 新增
+  setMouseFollow,       // 🔥 新增
 } = useLive2D();
 
-// 聊天功能 - Yvaine 说话时触发口型和表情
-const { history: chatHistory, isConnected, isConnecting, isTyping, isPlaying, send: sendChat, sendFeedback } = useChat(
-  // onYvaineSpeak - 收到文本时触发（只应用情绪表情，不启动口型）
-  (text: string, emotion?: string) => {
-    // 文本到达时只应用情绪表情
-    // 口型动画将在音频播放时由 phoneme 数据精确驱动
-    if (emotion) {
-      applyEmotion(emotion);
+// 动作 tag → Live2D 行为
+// 只处理肢体动作，表情类交给 emotion 处理，避免和 EMOTION_MAP 冲突
+function handleActions(actions: string[]) {
+  // 同一批动作只取第一个肢体动作，避免 playMotion 互相打断
+  for (const tag of actions) {
+    switch (tag) {
+      case 'wave':
+        playMotion('Tap', 0);
+        return;
+      case 'tilt_head':
+        // 模型没有歪头动作时，用媚眼动作占位；有 ParamAngleZ 可改为直接设参数
+        playMotion('Tap', 1);
+        return;
+      case 'nod':
+        playMotion('Tap', 0);
+        return;
+      case 'shake_head':
+        playMotion('Tap', 1);
+        return;
+      // smile / blush / pause / sigh / blink 不在这里处理，
+      // 表情由 onYvaineSpeak 的 emotion 决定，避免双重触发
+      default:
+        break;
     }
-    // 注意：不调用 speak()，避免提前启动口型动画
+  }
+}
+
+const {
+  history: chatHistory,
+  isConnected,
+  isConnecting,
+  isTyping,
+  isPlaying,
+  send: sendChat,
+  sendFeedback,
+} = useChat(
+  (text: string, emotion?: string) => {
+    if (emotion) applyEmotion(emotion);
   },
-  // onAudioPlay - 音频播放时触发（无 phoneme 时的回退）
   (duration: number) => {
-    // 根据音频时长播放口型动画（仅在无 phoneme 数据时生效）
     speak('', undefined, duration);
   },
-  // onPhonemes - 收到 phoneme 时间轴数据时触发精确口型同步
   (phonemes, emotion, audioStartTime) => {
     speakWithPhonemes(phonemes, emotion, audioStartTime);
-  }
+  },
+  handleActions,   // 🔥 第 4 个参数
 );
+
+function toggleMouseFollow() {
+  setMouseFollow(!mouseFollowEnabled.value);
+}
 
 function handleChatSend(text: string) {
   sendChat(text);
 }
 
-// 测试 TTS - 直接发送测试消息触发语音
 function handleTestTTS() {
   sendChat('测试语音功能');
 }
@@ -125,5 +167,33 @@ onBeforeUnmount(() => {
   color: rgba(255, 255, 255, 0.5);
   font-size: 12px;
   pointer-events: none;
+}
+
+/* 🔥 鼠标跟随开关 */
+.follow-toggle {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(20, 20, 40, 0.7);
+  color: #fff;
+  font-size: 16px;
+  cursor: pointer;
+  opacity: 0.5;
+  transition: all 0.2s;
+  z-index: 50;
+}
+
+.follow-toggle:hover {
+  opacity: 1;
+}
+
+.follow-toggle.active {
+  opacity: 0.9;
+  border-color: rgba(100, 200, 255, 0.6);
+  box-shadow: 0 0 8px rgba(100, 200, 255, 0.3);
 }
 </style>

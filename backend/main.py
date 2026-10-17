@@ -14,12 +14,7 @@ load_dotenv(Path(__file__).parent / ".env")
 PORT = int(os.getenv("PYTHON_PORT", "8000"))
 HOST = os.getenv("PYTHON_HOST", "127.0.0.1")
 
-VOLCANO_APPID = os.getenv("VOLCANO_APPID", "")
-VOLCANO_TOKEN = os.getenv("VOLCANO_TOKEN", "")
-VOLCANO_VOICE = os.getenv("VOLCANO_VOICE_TYPE", "zh_female_wanwanxiaohe_moon_bigtts")
-
 # TTS 模式: http / websocket / bidi (双向流式，支持 phoneme 时间戳)
-TTS_MODE = os.getenv("TTS_MODE", "bidi").lower()
 USE_OLLAMA = os.getenv("USE_OLLAMA", "false").lower() == "true"
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY", "")
@@ -29,117 +24,42 @@ def log(msg: str):
     print(msg, flush=True)
 
 # ========== 服务导入 ==========
-from services.tts_ws_service import TTSWebSocketService
-from services.tts_bidi_service import TTSBidirectionalService, TTSResult
-from services.chat_service import ChatService
-from services.llm import OllamaProvider, DeepSeekProvider
-from feedback_manager import save_feedback, get_feedback_stats
+from tts import TTSService, TTS_MODE, TTSWebSocketService, TTSBidirectionalService, TTSResult
+from core.chat_service import ChatService
+from feedback.manager import save_feedback, get_feedback_stats
+from llm import OllamaProvider, DeepSeekProvider
+
+# ========== 句子切分 ==========
+_SENTENCE_ENDINGS = "。！？!?."
 
 # ========== 待评分消息缓存 ==========
 pending_feedback: dict[str, dict] = {}
 _MAX_PENDING = 100  # 最多缓存 100 条未评分消息
 
-class TTSService:
-    @staticmethod
-    async def initialize():
-        """初始化 TTS 服务"""
-        if TTS_MODE == "bidi":
-            await TTSBidirectionalService.initialize()
-            log("[TTS] 使用双向流式模式 (支持 phoneme 时间戳)")
-        elif TTS_MODE == "websocket":
-            await TTSWebSocketService.initialize()
-            log("[TTS] 使用 WebSocket 单向流式模式")
-        else:
-            log("[TTS] 使用 HTTP V3 模式")
+class SentenceBuffer:
+    """累积流式文本，遇到句末标点切出一个完整句子"""
 
-    @staticmethod
-    async def synthesize(text: str, emotion: str = "") -> str:
-        """仅返回音频 base64（兼容旧接口）"""
-        if not text or not VOLCANO_TOKEN:
-            return ""
+    def __init__(self, min_len: int = 2):
+        self.buffer = ""
+        self.min_len = min_len
 
-        if TTS_MODE == "bidi":
-            result = await TTSBidirectionalService.synthesize(text, emotion)
-            return result.audio_base64
-        elif TTS_MODE == "websocket":
-            return await TTSWebSocketService.synthesize(text, emotion)
-        else:
-            return await TTSService._http_synthesize(text, emotion)
+    def feed(self, text: str) -> list[str]:
+        self.buffer += text
+        sentences = []
+        start = 0
+        for i, ch in enumerate(self.buffer):
+            if ch in _SENTENCE_ENDINGS:
+                sentence = self.buffer[start:i + 1].strip()
+                if len(sentence) >= self.min_len:
+                    sentences.append(sentence)
+                start = i + 1
+        self.buffer = self.buffer[start:]
+        return sentences
 
-    @staticmethod
-    async def synthesize_with_phonemes(text: str, emotion: str = "") -> TTSResult:
-        """返回音频 + phoneme 时间轴（新接口）"""
-        if not text or not VOLCANO_TOKEN:
-            return TTSResult()
-
-        if TTS_MODE == "bidi":
-            return await TTSBidirectionalService.synthesize(text, emotion)
-        else:
-            # 非 bidi 模式下只返回音频，phonemes 为空
-            result = TTSResult()
-            result.audio_base64 = await TTSService.synthesize(text, emotion)
-            return result
-
-    @staticmethod
-    async def _http_synthesize(text: str, emotion: str = "") -> str:
-        """HTTP V3 备用方案"""
-        import httpx
-
-        reqid = str(uuid.uuid4())
-        payload = {
-            "app": {"appid": VOLCANO_APPID, "token": VOLCANO_TOKEN, "cluster": "volcano_tts"},
-            "user": {"uid": "yvaine"},
-            "audio": {
-                "voice_type": VOLCANO_VOICE,
-                "encoding": "mp3",
-                "speed_ratio": 1.0,
-                "volume_ratio": 1.0,
-                "pitch_ratio": 1.0,
-            },
-            "request": {
-                "reqid": reqid,
-                "text": text,
-                "operation": "query",
-            },
-        }
-
-        if emotion:
-            payload["audio"]["emotion"] = emotion
-
-        headers = {
-            "Authorization": f"Bearer;{VOLCANO_TOKEN}",
-            "Content-Type": "application/json",
-            "X-Api-App-Id": VOLCANO_APPID,
-            "X-Api-Access-Key": VOLCANO_TOKEN,
-            "X-Api-Resource-Id": "volc.service_type.10029",
-            "X-Api-Request-Id": reqid,
-        }
-
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post("https://openspeech.bytedance.com/api/v3/tts/unidirectional", json=payload, headers=headers)
-
-        audio_chunks = []
-        async for line in resp.aiter_lines():
-            if not line.strip():
-                continue
-            try:
-                chunk_data = json.loads(line)
-                chunk_code = chunk_data.get("code", -1)
-                if chunk_code != 3000:
-                    log(f"[TTS] 错误: {chunk_data}")
-                    return ""
-                chunk_audio = chunk_data.get("data", "")
-                if chunk_audio:
-                    audio_chunks.append(chunk_audio)
-            except json.JSONDecodeError:
-                continue
-
-        if not audio_chunks:
-            log("[TTS] 合成返回空音频数据")
-            return ""
-
-        return "".join(audio_chunks)
-
+    def flush(self) -> str:
+        result = self.buffer.strip()
+        self.buffer = ""
+        return result
 
 
 # ========== FastAPI 应用 ==========
@@ -188,7 +108,7 @@ async def ws_chat(ws: WebSocket):
             data = await ws.receive_text()
             msg = json.loads(data)
 
-            # ---------- 分支 1：评分消息 ----------
+            # ---------- 评分消息 ----------
             if msg.get("type") == "feedback":
                 message_id = msg.get("messageId", "")
                 rating = msg.get("rating", "")
@@ -203,24 +123,38 @@ async def ws_chat(ws: WebSocket):
                             "messageId": message_id,
                         })
                     else:
-                        log(f"[Feedback] ⚠️ 未找到消息: {message_id[:8]}")
                         await ws.send_json({
                             "type": "feedback_ack",
                             "status": "not_found",
                             "messageId": message_id,
                         })
-                continue  # 评分消息处理完，不走聊天流程
+                continue
 
-            # ---------- 分支 2：普通聊天消息 ----------
+            # ---------- 聊天消息 ----------
             user_text = msg.get("text", "").strip()
             if not user_text:
                 continue
 
             log(f"[User] {user_text}")
 
-            # 获取回复
-            reply, emotion, sid = await ChatService.chat(user_text, session_id)
-            log(f"[渊鸢] {reply[:50]}... | 情绪: {emotion}")
+            # 流式接收 + 句子切分
+            sentence_buf = SentenceBuffer()
+            sentences: list[str] = []
+            emotion = "冷静"
+            message_id = str(uuid.uuid4())
+
+            async for event in ChatService.chat_stream(user_text, session_id):
+                if event["type"] == "chunk":
+                    sentences.extend(sentence_buf.feed(event["text"]))
+                elif event["type"] == "final":
+                    emotion = event["emotion"]
+                    actions = event.get("actions", [])
+                    tail = sentence_buf.flush()
+                    if tail:
+                        sentences.append(tail)
+
+            full_reply = "".join(sentences) if sentences else ""
+            log(f"[渊鸢] {full_reply[:50]}... | 情绪: {emotion}")
 
             # 情绪映射
             emotion_map = {
@@ -232,13 +166,12 @@ async def ws_chat(ws: WebSocket):
             }
             tts_emotion = emotion_map.get(emotion, "")
 
-            # 生成消息 ID 并缓存上下文（用于后续评分）
-            message_id = str(uuid.uuid4())
+            # 缓存反馈上下文
             pending_feedback[message_id] = {
                 "message_id": message_id,
                 "session_id": session_id,
                 "user_message": user_text,
-                "ai_reply": reply,
+                "ai_reply": full_reply,
                 "emotion": emotion,
                 "tts_emotion": tts_emotion,
             }
@@ -246,40 +179,42 @@ async def ws_chat(ws: WebSocket):
                 oldest = next(iter(pending_feedback))
                 del pending_feedback[oldest]
 
-            # 发送文本（带 messageId）
+            # 发送完整文本（前端一次性显示）
             await ws.send_json({
                 "type": "message",
-                "text": reply,
+                "text": full_reply,
                 "emotion": emotion,
-                "sessionId": sid,
-                "messageId": message_id,   # 🔥 前端拿到后用于评分
+                "actions": actions,
+                "sessionId": session_id,
+                "messageId": message_id,
             })
 
-            # TTS
-            tts_result = await TTSService.synthesize_with_phonemes(reply, emotion=tts_emotion)
-            if tts_result.audio_base64:
-                await ws.send_json({"type": "audio", "audioBase64": tts_result.audio_base64})
-                if tts_result.phonemes:
+            # 逐句合成 TTS 并按顺序发送
+            total = len(sentences)
+            for idx, sentence in enumerate(sentences):
+                tts_result = await TTSService.synthesize_with_phonemes(
+                    sentence, emotion=tts_emotion
+                )
+                if tts_result.audio_base64:
                     await ws.send_json({
-                        "type": "phonemes",
-                        "phonemes": [p.to_dict() for p in tts_result.phonemes],
-                        "words": [w.to_dict() for w in tts_result.words],
+                        "type": "audio",
+                        "audioBase64": tts_result.audio_base64,
+                        "phonemes": [p.to_dict() for p in tts_result.phonemes] if tts_result.phonemes else None,
+                        "words": [w.to_dict() for w in tts_result.words] if tts_result.words else None,
                         "durationMs": tts_result.duration_ms,
+                        "sequenceIndex": idx,
+                        "isLastChunk": idx == total - 1,
                     })
-                    log(f"🎵 音频+Phoneme 已发送 (情感: {tts_emotion or '默认'}, phonemes={len(tts_result.phonemes)})")
+                    log(f"🎵 句子 {idx+1}/{total} 音频已发送 ({len(sentence)} 字)")
                 else:
-                    log(f"🎵 音频已发送 (情感: {tts_emotion or '默认'})")
-            else:
-                log("⚠️ TTS 失败")
+                    log(f"⚠️ 句子 {idx+1}/{total} TTS 失败")
 
     except WebSocketDisconnect:
         log(f"💫 WebSocket 断开 | 会话: {session_id[:8]}...")
-        if session_id in ChatService.conversations:
-            del ChatService.conversations[session_id]
+        ChatService.clear_session(session_id)
     except Exception as e:
         log(f"❌ WebSocket 错误: {e}")
-        if session_id in ChatService.conversations:
-            del ChatService.conversations[session_id]
+        ChatService.clear_session(session_id)
 
 
 # ========== 启动 ==========
@@ -310,6 +245,13 @@ if __name__ == "__main__":
 
         # 4. 注入 ChatService
         ChatService.configure(provider=_provider, system_prompt=_system_prompt)
+
+        # 预热记忆系统（避免第一次对话卡在模型下载）
+        try:
+            from memory.vector_store import get_collection
+            get_collection()
+        except Exception as e:
+            log(f"⚠️ 记忆系统预热失败（不影响对话）: {e}")
 
         log(f"🚀 启动 Yvaine 后端服务 {HOST}:{PORT}")
         log(f"   环境变量 PYTHON_PORT={os.getenv('PYTHON_PORT', '未设置')}")

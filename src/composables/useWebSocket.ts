@@ -25,6 +25,9 @@ export interface ChatMessage {
   sessionId?: string;  // 会话ID
   messageId?: string;
   status?: string;
+  sequenceIndex?: number;
+  isLastChunk?: boolean; 
+  actions?: string[]; 
 }
 
 export function useWebSocket() {

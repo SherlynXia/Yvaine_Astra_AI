@@ -43,6 +43,7 @@ export function useLive2D() {
   const currentMouth = ref('');
   const currentHair = ref('');
   const currentAccessories = ref<Set<string>>(new Set());
+  const mouseFollowEnabled = ref(true);
 
   // 口型动画状态
   let mouthAnimationId: number | null = null;
@@ -98,15 +99,17 @@ export function useLive2D() {
     // 覆盖 model.focus()，让库自带的鼠标跟踪以头部为原点
     const originalFocus = m.focus.bind(m);
     m.focus = (x: number, y: number, instant?: boolean) => {
+      if (!mouseFollowEnabled.value) return;   // 🔥 关闭时跳过
       const head = getHeadPosition();
-      // 将世界坐标转换为以头部为原点的相对坐标
       const dx = x - head.x;
       const dy = y - head.y;
-      // 再转换回模型中心坐标系（库内部期望的坐标）
       const adjustedX = m.x + dx;
       const adjustedY = m.y + dy;
       originalFocus(adjustedX, adjustedY, instant);
     };
+
+    // 🔥 初始状态同步
+    m.autoInteract = mouseFollowEnabled.value;
 
     // 点击模型触发动作
     m.on('pointertap', () => {
@@ -270,6 +273,22 @@ export function useLive2D() {
     currentMouth.value = '';
     currentHair.value = '';
     currentAccessories.value.clear();
+  }
+  // 🔥 切换鼠标跟随
+  function setMouseFollow(enabled: boolean) {
+    mouseFollowEnabled.value = enabled;
+    const m = model.value as any;
+    if (m) {
+      m.autoInteract = enabled;
+      if (!enabled) {
+        // 关闭时把注视参数归零，避免视线卡在最后位置
+        setParam('ParamAngleX', 0);
+        setParam('ParamAngleY', 0);
+        setParam('ParamEyeBallX', 0);
+        setParam('ParamEyeBallY', 0);
+      }
+    }
+    console.log(`[Live2D] 鼠标跟随: ${enabled ? '开启' : '关闭'}`);
   }
 
   // 音素到口型参数的映射表（与后端保持一致）
@@ -556,5 +575,8 @@ export function useLive2D() {
     startSpeaking,
     stopSpeaking,
     destroy,
+    setParam,
+    mouseFollowEnabled, 
+    setMouseFollow, 
   };
 }
