@@ -6,6 +6,13 @@ import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from pathlib import Path
 
+MODEL_PATH = Path(__file__).parent.parent / "models" / "bge-small-zh"
+
+embedding_fn = SentenceTransformerEmbeddingFunction(
+    model_name=str(MODEL_PATH),
+    device="cpu",
+)
+
 CHROMA_PATH = Path(__file__).parent.parent / "data" / "chroma"
 CHROMA_PATH.mkdir(parents=True, exist_ok=True)
 

@@ -15,7 +15,7 @@ export interface WordInfo {
 }
 
 export interface ChatMessage {
-  type: 'message' | 'audio' | 'phonemes' | 'error' | 'feedback_ack';
+  type: 'message' | 'audio' | 'phonemes' | 'error' | 'feedback_ack'| 'user_list' | 'login_ack' | 'user_created';
   text?: string;
   emotion?: string;
   audioBase64?: string;
@@ -28,6 +28,9 @@ export interface ChatMessage {
   sequenceIndex?: number;
   isLastChunk?: boolean; 
   actions?: string[]; 
+  users?: { user_id: string; name: string; intimacy?: number }[];
+  userId?: string;
+  name?: string;
 }
 
 export function useWebSocket() {
@@ -50,6 +53,24 @@ export function useWebSocket() {
       messageId,
       rating,
     }));
+    return true;
+  };
+
+  const listUsers = (): boolean => {
+    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) return false;
+    ws.value.send(JSON.stringify({ type: 'list_users' }));
+    return true;
+  };
+
+  const switchUser = (userId: string): boolean => {
+    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) return false;
+    ws.value.send(JSON.stringify({ type: 'login', userId }));
+    return true;
+  };
+
+  const createUser = (name: string): boolean => {
+    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) return false;
+    ws.value.send(JSON.stringify({ type: 'create_user', name }));
     return true;
   };
 
@@ -164,5 +185,8 @@ export function useWebSocket() {
     disconnect,
     sendMessage,
     sendFeedback,
+    listUsers, 
+    switchUser, 
+    createUser,
   };
 }

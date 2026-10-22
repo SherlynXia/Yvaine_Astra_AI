@@ -89,8 +89,9 @@ class ChatService:
             print(f"[Chat] 🆕 新建会话: {session_id[:8]}...", flush=True)
 
         conv = cls.conversations[session_id]
-        user_id = await user_manager.identify_user()
+        user_id = await user_manager.identify_user(session_id=session_id)
         user_manager.get_current_user(user_id)
+        
 
         # 🔥 注入长期记忆（放到线程，不阻塞事件循环）
         memory_block = ""

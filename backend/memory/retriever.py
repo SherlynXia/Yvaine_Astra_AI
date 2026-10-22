@@ -38,6 +38,8 @@ def retrieve_memories(
         meta = database.get_memory(c["memory_id"])
         if not meta:
             continue
+        if meta.get("type") == "invalidated":
+            continue
 
         decay = _time_decay(meta.get("created_at", ""))
         score = similarity * decay * (0.5 + meta.get("importance", 0.5))

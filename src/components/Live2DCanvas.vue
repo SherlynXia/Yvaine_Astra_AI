@@ -26,9 +26,13 @@
       :is-connected="isConnected"
       :is-connecting="isConnecting"
       :is-typing="isTyping"
+      :users="users"
+      :current-user="currentUser"
       @send="handleChatSend"
       @test-tts="handleTestTTS"
       @feedback="sendFeedback"
+      @switch-user="switchUser"
+      @create-user="createUser"
     />
     <div class="hint">点击模型触发动作，鼠标移动控制视线</div>
   </div>
@@ -98,6 +102,10 @@ const {
   isPlaying,
   send: sendChat,
   sendFeedback,
+  users, 
+  currentUser, 
+  switchUser, 
+  createUser, 
 } = useChat(
   (text: string, emotion?: string) => {
     if (emotion) applyEmotion(emotion);

@@ -109,7 +109,9 @@ def touch_memory(memory_id: str):
 def list_memories(user_id: str, limit: int = 100) -> list[dict]:
     conn = get_conn()
     rows = conn.execute(
-        "SELECT * FROM memories WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+        "SELECT memory_id, user_id, type, content, importance, "
+        "created_at, last_accessed, access_count "
+        "FROM memories WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
         (user_id, limit),
     ).fetchall()
     return [dict(r) for r in rows]

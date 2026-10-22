@@ -11,13 +11,20 @@ export interface ChatHistoryItem {
   feedback?: 'good' | 'bad' | null;
 }
 
+
 export function useChat(
   onYvaineSpeak?: (text: string, emotion?: string) => void,
   onAudioPlay?: (duration: number) => void,
   onPhonemes?: (phonemes: PhonemeInfo[], emotion?: string, audioStartTime?: number) => void,
   onActions?: (actions: string[]) => void,
 ) {
-  const { connect, disconnect, sendMessage, sendFeedback: wsSendFeedback, isConnected, isConnecting, lastMessage, messageQueue, error } = useWebSocket();
+  const {
+    connect, disconnect, sendMessage, sendFeedback: wsSendFeedback,
+    listUsers: wsListUsers, switchUser: wsSwitchUser, createUser: wsCreateUser,
+    isConnected, isConnecting, lastMessage, messageQueue, error,
+  } = useWebSocket();
+  const users = ref<UserInfo[]>([]);
+  const currentUser = ref<UserInfo | null>(null);
   const history = ref<ChatHistoryItem[]>([]);
   const isTyping = ref(false);
   const isPlaying = ref(false);
@@ -31,6 +38,11 @@ export function useChat(
     const unlisten = await listen<number>('python-started', (event) => {
       console.log('✅ Python 后端已启动，端口:', event.payload);
       connect();
+      // 连接成功后，请求用户列表并默认登录
+      setTimeout(() => {
+        wsListUsers();
+        wsSwitchUser('default');
+      }, 500);
     });
     
     // 也监听 python-error 事件
@@ -55,6 +67,12 @@ export function useChat(
       unlisten();
     };
   });
+
+  interface UserInfo {
+    user_id: string;
+    name: string;
+    intimacy?: number;
+  }
 
   // ========== 音频队列 ==========
   interface AudioChunk {
@@ -163,6 +181,18 @@ export function useChat(
           if (msg.actions && msg.actions.length > 0) {
             onActions?.(msg.actions);
           }
+        } else if (msg.type === 'user_list') {
+          users.value = msg.users || [];
+          console.log('[Auth] 用户列表:', users.value);
+        } else if (msg.type === 'login_ack') {
+          currentUser.value = {
+            user_id: msg.userId || 'default',
+            name: msg.name || '主人',
+          };
+          console.log('[Auth] 已登录:', currentUser.value);
+        } else if (msg.type === 'user_created') {
+          console.log('[Auth] 新建用户:', msg.userId, msg.name);
+          wsListUsers();  // 刷新列表
         } else if (msg.type === 'audio' && msg.audioBase64) {
           console.log('🎵 收到音频片段', msg.sequenceIndex, '长度:', msg.audioBase64.length);
           // phonemes 现在跟 audio 一起到达
@@ -226,6 +256,17 @@ export function useChat(
     }
   }
 
+  function switchUser(userId: string) {
+  if (wsSwitchUser(userId)) {
+    history.value = [];  // 切换用户清空当前会话历史
+  }
+}
+
+function createUser(name: string) {
+  const trimmed = name.trim();
+  if (trimmed) wsCreateUser(trimmed);
+}
+
   return {
     history,
     isConnected,
@@ -239,5 +280,9 @@ export function useChat(
     disconnect,
     stopAudio,
     sendFeedback,
+    users, 
+    currentUser, 
+    switchUser, 
+    createUser,
   };
 }

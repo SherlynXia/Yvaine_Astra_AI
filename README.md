@@ -1,6 +1,6 @@
 # Yvaine Astra AI（渊鸢）
 
-一个基于 **Tauri + Vue + TypeScript** 的 Live2D AI 虚拟伴侣桌面应用，集成 **Python FastAPI** 后端，支持多轮对话、语音合成 (TTS) 与 Live2D 口型同步。
+一个基于 **Tauri + Vue + TypeScript** 的 Live2D AI 虚拟伴侣桌面应用，集成 **Python FastAPI** 后端，支持流式对话、语音合成、长期记忆、动作/对白分离与 Live2D 口型同步。
 
 ---
 
@@ -44,7 +44,9 @@ Yvaine_Astra_AI/
 │   │   ├── vector_store.py         # ChromaDB
 │   │   ├── extractor.py            # 记忆提取
 │   │   ├── retriever.py            # 记忆检索
-│   │   └── user_manager.py         # 用户 + 声纹接口占位
+│   │   ├── user_manager.py         # 用户 + 声纹接口占位
+│   │   ├── lifecycle.py            # TTL 清理 + 衰减 + 反思调度
+│   │   └── reflection.py           # 从多条事实归纳规律
 │   ├── feedback/                   # 📊 反馈层
 │   │   └── manager.py
 │   ├── personality/
@@ -55,6 +57,9 @@ Yvaine_Astra_AI/
 │   │   ├── chroma/                 # 向量库（不提交）
 │   │   ├── conversations/
 │   │   └── memories/
+│   ├── memory_cli.py               # 记忆管理 CLI
+│   ├── models/
+│   │   └── bge-small-zh/           # 本地嵌入模型（不提交 Git）
 │   └── training/
 │       └── README.md
 ├── src/                            # Vue 前端
@@ -102,6 +107,8 @@ Yvaine_Astra_AI/
 - 建立聊天功能 (`useChat`)，连接到 Python 后端
 - 渲染 `ExpressionPanel`、`MotionPanel`、`ChatPanel` 子组件
 - 管理窗口 resize 事件
+- 鼠标跟随开关（右上角 `👁️` / `🚫`）
+- 接收 `actions` 并映射为模型参数变化
 
 #### `ChatPanel.vue` — 聊天面板
 聊天 UI 组件，提供：
@@ -110,6 +117,8 @@ Yvaine_Astra_AI/
 - 消息列表（用户/AI 气泡）
 - 文本输入与发送
 - TTS 测试按钮
+- 用户下拉框 + 新建用户按钮（`＋`）
+- 每条 AI 消息下方 👍/👎 评分按钮
 
 | Props | 类型 | 说明 |
 |-------|------|------|
@@ -117,12 +126,16 @@ Yvaine_Astra_AI/
 | `isConnected` | `boolean` | WebSocket 连接状态 |
 | `isConnecting` | `boolean` | 是否正在连接 |
 | `isTyping` | `boolean` | AI 是否正在生成回复 |
+| `users` | `{ user_id: string; name: string }[]` | 用户列表 |
+| `currentUser` | `{ user_id: string; name: string } \| null` | 当前登录用户 |
 
 | Emits | 参数 | 说明 |
 |-------|------|------|
 | `send` | `text: string` | 发送用户消息 |
 | `testTTS` | - | 触发 TTS 测试 |
 | `feedback` | `messageId: string, rating: 'good' \| 'bad'` | 用户评分 |
+| `switchUser` | `userId: string` | 切换用户 |
+| `createUser` | `name: string` | 新建用户 |
 
 #### `ExpressionPanel.vue` — 表情控制面板
 Live2D 表情参数切换面板，分类控制：
@@ -162,12 +175,15 @@ Live2D 动作触发面板，提供：
 PhonemeInfo { phoneme, startTime, endTime, confidence }
 WordInfo { word, startTime, endTime, confidence }
 ChatMessage {
-  type: 'message' | 'audio' | 'phonemes' | 'error' | 'feedback_ack'
+  type: 'message' | 'audio' | 'phonemes' | 'error' | 'feedback_ack' | 'user_list' | 'login_ack' | 'user_created'
   text?, emotion?, audioBase64?, phonemes?, words?, durationMs?,
   sessionId?, messageId?, status?,
   actions?: string[]           // 动作 tag 列表
   sequenceIndex?: number       // 音频片段序号
   isLastChunk?: boolean        // 是否最后一段音频
+  users?: { user_id: string; name: string; intimacy?: number }[];
+  userId?: string;
+  name?: string;
 }
 ```
 
@@ -185,11 +201,14 @@ ChatMessage {
 | `connect()` | `() => Promise<void>` | 建立连接 |
 | `disconnect()` | `() => void` | 断开连接 |
 | `sendMessage(text)` | `(text: string) => boolean` | 发送文本消息 |
+| `listUsers()` | `() => boolean` | 请求用户列表 |
+| `switchUser(userId)` | `(id: string) => boolean` | 切换用户 |
+| `createUser(name)` | `(name: string) => boolean` | 新建用户 |
 
 #### `useChat.ts` — 聊天逻辑
 管理对话状态、音频播放、音素口型同步。
 
-**导出函数：** `useChat(onYvaineSpeak?, onAudioPlay?, onPhonemes?)`
+**导出函数：** `useChat(onYvaineSpeak?, onAudioPlay?, onPhonemes?, onActions?)`
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
@@ -212,6 +231,10 @@ ChatMessage {
 | `disconnect()` | `() => void` | 断开连接 |
 | `stopAudio()` | `() => void` | 停止音频播放 |
 | `sendFeedback(messageId, rating)` | `(id: string, r: 'good' \| 'bad') => void` | 提交评分 |
+| `users` | `Ref<UserInfo[]>` | 用户列表 |
+| `currentUser` | `Ref<UserInfo \| null>` | 当前登录用户 |
+| `switchUser(userId)` | `(id: string) => void` | 切换用户（清空历史） |
+| `createUser(name)` | `(name: string) => void` | 新建用户 |
 
 **内部函数：**
 - `decodeBase64Audio()` — base64 → Blob → Audio
@@ -305,13 +328,21 @@ ChatMessage {
 
 **WebSocket 消息格式：**
 
+- 客户端 → 服务端（登录）：`{"type": "login", "userId": "..."}`
+- 客户端 → 服务端（用户列表）：`{"type": "list_users"}`
+- 客户端 → 服务端（新建用户）：`{"type": "create_user", "name": "..."}`
 - 客户端 → 服务端（聊天）：`{"text": "..."}`
 - 客户端 → 服务端（评分）：`{"type": "feedback", "messageId": "xxx", "rating": "good"}`
+- 服务端 → 客户端（登录确认）：`{"type": "login_ack", "userId": "...", "name": "..."}`
+- 服务端 → 客户端（用户列表）：`{"type": "user_list", "users": [...]}`
+- 服务端 → 客户端（新建用户）：`{"type": "user_created", "user_id": "...", "name": "..."}`
 - 服务端 → 客户端（文本）：
   ```json
   {"type": "message", "text": "...", "emotion": "...", "actions": ["tilt_head"], "sessionId": "...", "messageId": "..."}
 - 服务端 → 客户端（评分确认）：`{"type": "feedback_ack", "status": "ok", "messageId": "..."}`
 - 服务端 → 客户端（音频片段）：`{"type": "audio", "audioBase64": "...", "phonemes": [...], "sequenceIndex": 0, "isLastChunk": false}`
+
+**startup 钩子**：启动 `lifecycle_loop`，每 6 小时跑一次 TTL 清理 / 衰减 / 反思调度。
 
 ---
 
@@ -345,16 +376,40 @@ ChatMessage {
 | `tts/websocket.py` | WebSocket V3 单向流式 |
 | `tts/bidi.py` | 双向流式，返回音频 + phoneme 时间轴 |
 
-### 5. Memory 层（新增）
+### 5. Memory 层
 
 | 文件 | 说明 |
 |------|------|
-| `memory/short_term.py` | `ConversationStore` — 单会话滑动窗口（10 轮） |
+| `memory/short_term.py` | `ConversationStore` — 单会话 10 轮滑动窗口 |
 | `memory/database.py` | SQLite — `users` + `memories` 两张表 |
-| `memory/vector_store.py` | ChromaDB — `BAAI/bge-small-zh-v1.5` 嵌入，cosine 检索 |
-| `memory/extractor.py` | 规则预筛 + LLM 精提取，去重后写入 |
-| `memory/retriever.py` | 语义检索 + 时间衰减 + 重要度加权，拼成 Prompt 段落 |
-| `memory/user_manager.py` | 用户管理，`identify_user()` 当前返回 `default`，声纹接口占位 |
+| `memory/vector_store.py` | ChromaDB — 本地 `bge-small-zh-v1.5`，cosine 检索 |
+| `memory/extractor.py` | 规则预筛 + LLM 精提取 + `evidence` 原话验证 + `invalidate` 失效检测 |
+| `memory/retriever.py` | 语义检索 + 时间衰减 + 重要度加权，过滤 `invalidated` |
+| `memory/lifecycle.py` | TTL 清理 + 衰减（`fact`/`reflection` 豁免）+ 反思调度 |
+| `memory/reflection.py` | 从多条事实归纳规律，`evidence_ids` 至少 2 条真实存在 |
+| `memory/user_manager.py` | 登录选择模式，`identify_user(audio_data, session_id)` 声纹接口预留 |
+
+**记忆类型**：`fact` / `event` / `emotion` / `reflection` / `invalidated`。
+
+**提取规则**：
+- 只从用户消息提取（不含 AI 回复）
+- `evidence` 必须原样出现在用户原话中，否则丢弃
+- 含"不/不再/其实/改成"时，检索已有记忆判断 `invalidate` / `update`
+
+**生命周期**：
+- `event` 90 天、`emotion` 30 天过期
+- `fact` / `reflection` 永不删除、不参与衰减
+- 超过 30 天未访问的 `event` / `emotion` 重要度 × 0.9
+
+**记忆管理 CLI**：
+
+```bash
+python backend/memory_cli.py list
+python backend/memory_cli.py delete 3ba1d754
+python backend/memory_cli.py delete-keyword 牛奶
+python backend/memory_cli.py clear-user cd4ad67b
+python backend/memory_cli.py stats
+```
 
 ### 6. Feedback 层
 
@@ -382,6 +437,8 @@ ChatMessage {
 2. 动作描写（如有肢体动作，用 `()` 包裹）
 3. 情绪标签 `[情绪:xxx]`，13 个可选值
 
+**关于记忆的约束**：没有明确记忆时不要编造主人的喜好或经历。
+
 ---
 
 ## 启动方式
@@ -397,7 +454,14 @@ cd backend
 pip install -r requirements.txt
 ```
 
-### 2. 配置环境变量
+### 2. 下载嵌入模型（首次）
+
+```powershell
+$env:HF_ENDPOINT = "https://hf-mirror.com"
+python -c "from huggingface_hub import snapshot_download; snapshot_download('BAAI/bge-small-zh-v1.5', local_dir=r'D:\Project\Yvaine_Astra_AI\backend\models\bge-small-zh')"
+```
+
+### 3. 配置环境变量
 
 复制 `backend/.env.example` 为 `backend/.env`，填入必要的 API Key：
 
@@ -416,14 +480,14 @@ USE_OLLAMA=false
 OLLAMA_MODEL=qwen2.5:3b
 ```
 
-### 3. 启动
+### 4. 启动
 
 ```bash
 # 开发模式（仅前端）
-npm run dev
+pnpm run dev
 
 # Tauri 桌面模式（自动启动 Python 后端）
-npm run tauri dev
+pnpm run tauri dev
 ```
 
 ---
@@ -437,7 +501,7 @@ npm run tauri dev
 用户输入
 → useChat.send() → WebSocket
 → core/chat_service.chat_stream()
-├── memory/retriever 检索相关记忆 → 注入 System Prompt
+├── memory/retriever 检索记忆（按 user_id 隔离）→ 注入 System Prompt
 ├── llm 流式生成
 └── 每满一句 → 句子切分
 → tts/facade 逐句合成音频
@@ -446,7 +510,19 @@ npm run tauri dev
 → useLive2D.speakWithPhonemes 口型同步
 → memory/extractor 异步提取记忆（不阻塞）
 ```
+### 动作/对白分离
+LLM 原始输出: "唔...表情测试啊。(顿了顿，歪个头) 这样够明显么？[情绪:疑惑]"
+↓ ActionParser
+对白: "唔...表情测试啊。 这样够明显么？" → TTS
+动作: ["顿了顿，歪个头"] → 映射为 tilt_head → Live2D 参数
+情绪: "疑惑" → EMOTION_MAP 表情
 
+
+### 记忆生命周期
+每 6 小时：
+├── TTL 清理（event 90 天 / emotion 30 天）
+├── 衰减（未访问 > 30 天的 event/emotion 降权）
+└── 每 7 天：反思（fact+event ≥ 10 条时，归纳规律性认识）
 
 ### 反馈回路（数据飞轮起点）
 

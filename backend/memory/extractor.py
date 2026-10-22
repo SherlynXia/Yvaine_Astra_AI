@@ -9,57 +9,38 @@ from llm.base import LLMProvider
 FACT_TRIGGERS = ["我喜欢", "我不喜欢", "我是", "我叫", "我的", "记住", "以后", "下次", "讨厌", "爱吃", "住在"]
 EVENT_TRIGGERS = ["今天", "昨天", "完成了", "失败了", "开始了", "结束了", "刚", "刚才"]
 
-EXTRACT_PROMPT = """从下面这段对话中，提取关于"用户"的、值得长期记住的信息。
+EXTRACT_PROMPT = """从下面【用户说的话】中，提取关于用户的明确事实，并判断它对已有记忆的影响。
 
-【必须提取的内容】
-- 用户的名字、称呼、身份
-- 用户的喜好/厌恶（喜欢什么、讨厌什么）
-- 用户的个人情况（住在哪、做什么工作、在做什么项目）
-- 明确发生的事件（完成了什么、开始了什么）
+⚠️ 严格规则：
+1. 只提取用户**亲口说出来**的内容。
+2. 不要推测、不要补全。
+3. 如果用户只是提问，不是事实，不要提取。
+4. evidence 必须是【用户说的话】里**原样出现**的片段。
 
-【不要提取】
-- 推测性内容
-- 寒暄、问候
-- AI 自己的信息
+【已有记忆（可能为空）】
+{existing_memories}
 
-【输出格式】
-严格 JSON 数组。每个元素：
-{{"type": "fact"|"event", "content": "一句话描述", "importance": 0.0-1.0}}
-没有值得记的输出 []。
+【用户说的话】
+{user_message}
 
-【示例 1】
-对话：
-用户：我是夏凛，你呢
-渊鸢：你好夏凛，我是渊鸢。
-输出：
-[{{"type": "fact", "content": "用户叫夏凛", "importance": 0.9}}]
+输出严格 JSON 数组，每个元素：
+{{
+  "action": "add" | "invalidate" | "update",
+  "type": "fact" | "event" | "emotion",
+  "content": "一句话描述",
+  "evidence": "用户原话中的证据片段",
+  "target_memory_id": "action 为 invalidate/update 时填，指被推翻的旧记忆 id，否则为空字符串",
+  "importance": 0.0-1.0
+}}
 
-【示例 2】
-对话：
-用户：我喜欢喝冰美式
-渊鸢：记下了。
-输出：
-[{{"type": "fact", "content": "用户喜欢喝冰美式", "importance": 0.7}}]
+action 判断：
+- "add"：用户说了新事实，与已有记忆不冲突
+- "invalidate"：用户明确否定旧记忆（"我不喜欢牛奶了"）
+- "update"：用户修正旧记忆（"我其实叫夏凛，不是夏林"）
 
-【示例 3】
-对话：
-用户：今天项目终于跑通了
-渊鸢：恭喜。
-输出：
-[{{"type": "event", "content": "用户在 {today} 项目跑通了", "importance": 0.6}}]
-
-【示例 4】
-对话：
-用户：今天天气不错
-渊鸢：是啊。
-输出：
-[]
-
-【实际对话】
-{conversation}
+没有值得记的，输出 []。
 
 JSON："""
-
 
 def _should_extract(text: str) -> bool:
     return any(t in text for t in FACT_TRIGGERS + EVENT_TRIGGERS)
@@ -84,27 +65,37 @@ async def extract_and_store(
     provider: LLMProvider,
     user_id: str,
     user_message: str,
-    ai_reply: str,
+    ai_reply: str = "",
 ):
     print(f"[Memory] 🔍 extract_and_store 被调用", flush=True)
-    combined = f"{user_message}\n{ai_reply}"
-    hit = _should_extract(combined)
-    print(f"[Memory] 🔍 触发器命中={hit}", flush=True)
-    if not hit:
+
+    # 1. 触发器预筛
+    if not _should_extract(user_message):
+        print(f"[Memory] 🔍 触发器未命中，跳过", flush=True)
         return
 
-    conversation = f"用户：{user_message}\n渊鸢：{ai_reply}"
-    from datetime import date
+    # 2. 检索可能冲突的已有记忆（只在含否定/修正词时查，省算力）
+    existing_text = ""
+    negation_words = ["不", "不再", "没有", "其实", "改成", "以前", "曾经"]
+    if any(w in user_message for w in negation_words):
+        candidates = vector_store.query_vectors(user_message, user_id, top_k=3)
+        lines = []
+        for c in candidates:
+            if c["distance"] < 0.6:  # 只保留相关的
+                lines.append(f"[{c['memory_id']}] {c['content']}")
+        existing_text = "\n".join(lines)
+        if lines:
+            print(f"[Memory] 🔍 检索到 {len(lines)} 条可能冲突的记忆", flush=True)
+
     prompt = EXTRACT_PROMPT.format(
-        conversation=conversation,
-        today=date.today().isoformat(),
+        user_message=user_message,
+        existing_memories=existing_text or "（无）",
     )
 
-    print(f"[Memory] 🤖 调用 LLM 提取中...", flush=True)
     try:
         raw = await provider.chat(
             [{"role": "user", "content": prompt}],
-            temperature=0.2,   # 🔥 提取任务要服从指令，低温
+            temperature=0.2,
         )
         print(f"[Memory] 🤖 LLM 返回: {raw[:300]}", flush=True)
     except Exception as e:
@@ -112,7 +103,6 @@ async def extract_and_store(
         return
 
     items = _parse_json_array(raw)
-    print(f"[Memory] 🔍 解析出 {len(items)} 条候选", flush=True)
     if not items:
         return
 
@@ -120,27 +110,52 @@ async def extract_and_store(
     for item in items:
         if not isinstance(item, dict):
             continue
+
+        action = str(item.get("action", "add")).strip()
         content = str(item.get("content", "")).strip()
         mem_type = str(item.get("type", "fact")).strip()
+        evidence = str(item.get("evidence", "")).strip()
+        target_id = str(item.get("target_memory_id", "")).strip()
         try:
             importance = float(item.get("importance", 0.5))
         except (TypeError, ValueError):
             importance = 0.5
 
-        print(f"[Memory] 🔍 候选: type={mem_type}, importance={importance}, content={content}", flush=True)
+        print(f"[Memory] 🔍 候选: action={action}, content={content}, evidence={evidence!r}", flush=True)
 
         if not content or len(content) < 3:
-            print(f"[Memory] ⏭️ 跳过: 内容太短", flush=True)
+            continue
+        if not evidence or evidence not in user_message:
+            print(f"[Memory] ⏭️ 跳过: evidence 不在用户原话中", flush=True)
             continue
         if mem_type not in ("fact", "event", "emotion", "reflection"):
             mem_type = "fact"
         if importance < 0.5:
-            print(f"[Memory] ⏭️ 跳过: importance {importance} < 0.5", flush=True)
             continue
 
+        # ---------- invalidate：软删除旧记忆 ----------
+        if action in ("invalidate", "update") and target_id:
+            conn = database.get_conn()
+            row = conn.execute(
+                "SELECT memory_id, content FROM memories WHERE memory_id LIKE ?",
+                (f"{target_id}%",),
+            ).fetchone()
+            if row:
+                full_id, old_content = row["memory_id"], row["content"]
+                conn.execute(
+                    "UPDATE memories SET importance = 0.1, type = 'invalidated' WHERE memory_id = ?",
+                    (full_id,),
+                )
+                conn.commit()
+                vector_store.delete_vector(full_id)
+                print(f"[Memory] 🗑️ 失效旧记忆: {old_content}", flush=True)
+            else:
+                print(f"[Memory] ⚠️ 找不到目标记忆: {target_id}", flush=True)
+
+        # ---------- add / update：写入新记忆 ----------
         similar = vector_store.query_vectors(content, user_id, top_k=1)
         if similar and similar[0]["distance"] < 0.1:
-            print(f"[Memory] ⏭️ 跳过: 与已有记忆重复 (distance={similar[0]['distance']:.3f})", flush=True)
+            print(f"[Memory] ⏭️ 跳过: 重复", flush=True)
             continue
 
         memory_id = database.insert_memory(user_id, mem_type, content, importance)

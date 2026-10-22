@@ -8,10 +8,28 @@
 
     <!-- 聊天内容区 -->
     <div v-show="isExpanded" class="chat-content">
-      <!-- 连接状态 -->
+      <!-- 连接状态 + 用户选择 -->
       <div class="status-bar">
         <span class="status-dot" :class="{ connected: isConnected }"></span>
         <span class="status-text">{{ statusText }}</span>
+
+        <!-- 🔥 用户选择 -->
+        <div class="user-switcher" v-if="isConnected">
+          <select
+            :value="currentUser?.user_id || 'default'"
+            @change="onUserChange"
+            class="user-select"
+          >
+            <option
+              v-for="u in users"
+              :key="u.user_id"
+              :value="u.user_id"
+            >
+              {{ u.name || u.user_id.slice(0, 6) }}
+            </option>
+          </select>
+          <button class="user-add-btn" @click="promptCreateUser" title="新建用户">＋</button>
+        </div>
       </div>
 
       <!-- 消息列表 -->
@@ -100,12 +118,16 @@ const props = defineProps<{
     messageId?: string;
     feedback?: 'good' | 'bad' | null;
   }[];
+  users: { user_id: string; name: string }[];
+  currentUser: { user_id: string; name: string } | null;
   isConnected: boolean;
   isConnecting: boolean;
   isTyping: boolean;
 }>();
 
 const emit = defineEmits<{
+  switchUser: [userId: string];
+  createUser: [name: string];
   send: [text: string];
   testTTS: [];
   feedback: [messageId: string, rating: 'good' | 'bad'];
@@ -123,6 +145,18 @@ const statusText = computed(() => {
 const canSend = computed(() => {
   return inputText.value.trim().length > 0 && !props.isTyping && !props.isConnecting;
 });
+
+function onUserChange(e: Event) {
+  const target = e.target as HTMLSelectElement;
+  emit('switchUser', target.value);
+}
+
+function promptCreateUser() {
+  const name = window.prompt('新用户的名字：');
+  if (name && name.trim()) {
+    emit('createUser', name.trim());
+  }
+}
 
 function toggleExpand() {
   isExpanded.value = !isExpanded.value;
@@ -260,7 +294,47 @@ function testTTS() {
   flex-shrink: 0;
 }
 
-/* 🔥 新增：气泡和评分按钮的容器 */
+.user-switcher {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.user-select {
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.8);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-size: 11px;
+  outline: none;
+  cursor: pointer;
+  max-width: 90px;
+}
+
+.user-select:focus {
+  border-color: #667eea;
+}
+
+.user-add-btn {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.user-add-btn:hover {
+  border-color: rgba(100, 200, 255, 0.6);
+  color: rgba(100, 200, 255, 0.9);
+}
+
 .bubble-wrapper {
   display: flex;
   flex-direction: column;

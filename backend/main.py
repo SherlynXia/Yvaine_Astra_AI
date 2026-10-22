@@ -26,6 +26,7 @@ def log(msg: str):
 # ========== 服务导入 ==========
 from tts import TTSService, TTS_MODE, TTSWebSocketService, TTSBidirectionalService, TTSResult
 from core.chat_service import ChatService
+from memory import user_manager
 from feedback.manager import save_feedback, get_feedback_stats
 from llm import OllamaProvider, DeepSeekProvider
 
@@ -92,6 +93,16 @@ async def test_tts_emotion():
         results[emotion] = {"status": "ok" if audio else "error", "length": len(audio) if audio else 0}
     return {"mode": TTS_MODE, "results": results}
 
+@app.on_event("startup")
+async def _startup_lifecycle():
+    from memory.lifecycle import lifecycle_loop
+    provider = ChatService._provider
+    if provider is None:
+        print("[Memory] ⚠️ LLM Provider 未配置，生命周期任务跳过", flush=True)
+        return
+    asyncio.create_task(lifecycle_loop(provider, interval_hours=6.0))
+    print("[Memory] 🧹 生命周期任务已启动（每 6 小时）", flush=True)
+
 @app.get("/feedback/stats")
 async def feedback_stats():
     """反馈统计"""
@@ -107,6 +118,36 @@ async def ws_chat(ws: WebSocket):
         while True:
             data = await ws.receive_text()
             msg = json.loads(data)
+
+            # ---------- 登录 ----------
+            if msg.get("type") == "login":
+                user_id = msg.get("userId", "default")
+                user_manager.bind_session(session_id, user_id)
+                user = user_manager.get_current_user(user_id)
+                log(f"[Auth] 登录: {user.get('name')} ({user_id[:8]})")
+                await ws.send_json({
+                    "type": "login_ack",
+                    "userId": user_id,
+                    "name": user.get("name", ""),
+                })
+                continue
+
+            # ---------- 获取用户列表 ----------
+            if msg.get("type") == "list_users":
+                await ws.send_json({
+                    "type": "user_list",
+                    "users": user_manager.list_users(),
+                })
+                continue
+
+            # ---------- 新建用户 ----------
+            if msg.get("type") == "create_user":
+                name = msg.get("name", "").strip()
+                if name:
+                    user = user_manager.create_user(name)
+                    log(f"[Auth] 新建用户: {name}")
+                    await ws.send_json({"type": "user_created", **user})
+                continue
 
             # ---------- 评分消息 ----------
             if msg.get("type") == "feedback":
@@ -211,9 +252,11 @@ async def ws_chat(ws: WebSocket):
 
     except WebSocketDisconnect:
         log(f"💫 WebSocket 断开 | 会话: {session_id[:8]}...")
+        user_manager.unbind_session(session_id)
         ChatService.clear_session(session_id)
     except Exception as e:
         log(f"❌ WebSocket 错误: {e}")
+        user_manager.unbind_session(session_id)
         ChatService.clear_session(session_id)
 
 
@@ -247,11 +290,14 @@ if __name__ == "__main__":
         ChatService.configure(provider=_provider, system_prompt=_system_prompt)
 
         # 预热记忆系统（避免第一次对话卡在模型下载）
+        log("[Memory] 🔄 开始预热 ChromaDB...")
         try:
             from memory.vector_store import get_collection
             get_collection()
+            log("[Memory] ✅ 预热完成")
         except Exception as e:
             log(f"⚠️ 记忆系统预热失败（不影响对话）: {e}")
+
 
         log(f"🚀 启动 Yvaine 后端服务 {HOST}:{PORT}")
         log(f"   环境变量 PYTHON_PORT={os.getenv('PYTHON_PORT', '未设置')}")
