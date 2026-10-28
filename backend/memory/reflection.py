@@ -92,7 +92,11 @@ async def generate_reflections(
             continue
 
         # 去重
-        similar = vector_store.query_vectors(content, user_id, top_k=1)
+        similar = vector_store.query_vectors(
+            content,
+            where={"$and": [{"subject_id": user_id}, {"scope": "private"}]},
+            top_k=1,
+        )
         if similar and similar[0]["distance"] < 0.15:
             print(f"[Reflection] ⏭️ 跳过: 重复", flush=True)
             continue

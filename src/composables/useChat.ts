@@ -259,6 +259,7 @@ export function useChat(
   function switchUser(userId: string) {
   if (wsSwitchUser(userId)) {
     history.value = [];  // 切换用户清空当前会话历史
+    isTyping.value = false;
   }
 }
 

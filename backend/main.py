@@ -103,6 +103,19 @@ async def _startup_lifecycle():
     asyncio.create_task(lifecycle_loop(provider, interval_hours=6.0))
     print("[Memory] 🧹 生命周期任务已启动（每 6 小时）", flush=True)
 
+@app.on_event("startup")
+async def _startup_warmup():
+    """ChromaDB 异步预热，不阻塞端口监听"""
+    async def _warmup():
+        try:
+            from memory.vector_store import get_collection
+            await asyncio.to_thread(get_collection)
+            log("[Memory] ✅ ChromaDB 预热完成")
+        except Exception as e:
+            log(f"⚠️ ChromaDB 预热失败（首次聊天时会懒加载）: {e}")
+
+    asyncio.create_task(_warmup())
+
 @app.get("/feedback/stats")
 async def feedback_stats():
     """反馈统计"""
@@ -254,6 +267,7 @@ async def ws_chat(ws: WebSocket):
         log(f"💫 WebSocket 断开 | 会话: {session_id[:8]}...")
         user_manager.unbind_session(session_id)
         ChatService.clear_session(session_id)
+        ChatService.clear_scene(session_id)
     except Exception as e:
         log(f"❌ WebSocket 错误: {e}")
         user_manager.unbind_session(session_id)
@@ -289,21 +303,12 @@ if __name__ == "__main__":
         # 4. 注入 ChatService
         ChatService.configure(provider=_provider, system_prompt=_system_prompt)
 
-        # 预热记忆系统（避免第一次对话卡在模型下载）
-        log("[Memory] 🔄 开始预热 ChromaDB...")
-        try:
-            from memory.vector_store import get_collection
-            get_collection()
-            log("[Memory] ✅ 预热完成")
-        except Exception as e:
-            log(f"⚠️ 记忆系统预热失败（不影响对话）: {e}")
-
 
         log(f"🚀 启动 Yvaine 后端服务 {HOST}:{PORT}")
         log(f"   环境变量 PYTHON_PORT={os.getenv('PYTHON_PORT', '未设置')}")
         log(f"   工作目录: {os.getcwd()}")
         log(f"   TTS 模式: {TTS_MODE}")
-        uvicorn.run("main:app", host=HOST, port=PORT, reload=False)
+        uvicorn.run(app, host=HOST, port=PORT, reload=False)
 
     except KeyboardInterrupt:
         log("\n👋 收到退出信号，正在清理...")

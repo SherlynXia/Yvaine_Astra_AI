@@ -57,7 +57,11 @@ def _delete_many(ids: list[str]):
 
 def cmd_list(args):
     conn = _conn()
-    sql = "SELECT memory_id, user_id, type, importance, created_at, last_accessed, access_count, content FROM memories"
+    sql = (
+        "SELECT memory_id, user_id, subject_id, scope, source_id, "
+        "type, importance, created_at, last_accessed, access_count, content "
+        "FROM memories"
+    )
     params = []
     if args.user:
         sql += " WHERE user_id LIKE ?"
@@ -71,9 +75,13 @@ def cmd_list(args):
         return
 
     print(f"共 {len(rows)} 条\n")
-    for mid, uid, mtype, imp, created, accessed, acc, content in rows:
-        print(f"{mid[:8]}  user={uid[:8]}  {mtype:10}  imp={imp:.2f}  acc={acc}  {created[:10]}")
-        print(f"          {content}")
+    for r in rows:
+        print(
+            f"{r[0][:8]}  user={r[1][:8]}  subject={(r[2] or '')[:8]}  "
+            f"scope={r[3]:8}  source={(r[4] or '')[:8]}  {r[5]:10}  "
+            f"imp={r[6]:.2f}  acc={r[9]}  {r[7][:10]}"
+        )
+        print(f"          {r[10]}")
         print()
 
 

@@ -42,7 +42,14 @@ def unbind_session(session_id: str) -> None:
 
 def get_current_user(user_id: str = DEFAULT_USER_ID) -> dict:
     """获取或创建用户"""
-    return database.get_or_create_user(user_id, name=DEFAULT_USER_NAME if user_id == DEFAULT_USER_ID else "")
+    user = database.get_or_create_user(
+        user_id,
+        name=DEFAULT_USER_NAME if user_id == DEFAULT_USER_ID else "",
+    )
+    if not user.get("name"):
+        # 空名字兜底：用 user_id 前 8 位，至少能区分
+        user["name"] = DEFAULT_USER_NAME if user_id == DEFAULT_USER_ID else user_id[:8]
+    return user
 
 
 def list_users() -> list[dict]:

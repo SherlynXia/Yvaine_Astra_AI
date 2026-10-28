@@ -342,7 +342,9 @@ ChatMessage {
 - 服务端 → 客户端（评分确认）：`{"type": "feedback_ack", "status": "ok", "messageId": "..."}`
 - 服务端 → 客户端（音频片段）：`{"type": "audio", "audioBase64": "...", "phonemes": [...], "sequenceIndex": 0, "isLastChunk": false}`
 
-**startup 钩子**：启动 `lifecycle_loop`，每 6 小时跑一次 TTL 清理 / 衰减 / 反思调度。
+**startup 钩子**：
+- `_startup_lifecycle`：启动 `lifecycle_loop`，每 6 小时跑一次 TTL 清理 / 衰减写回 / 反思调度
+- `_startup_warmup`：异步预热 ChromaDB（`asyncio.create_task`，不阻塞端口监听）
 
 ---
 
@@ -350,8 +352,11 @@ ChatMessage {
 
 #### `core/chat_service.py`
 - `ChatService.configure(provider, system_prompt)` — 注入 LLM 和人格
-- `ChatService.chat_stream(user_message, session_id)` — 流式对话，串联：记忆检索 → 注入 Prompt → LLM 流式 → 动作/对白分离 → 情绪解析 → 记忆提取
-- `ChatService.clear_session(session_id)`
+- `ChatService.chat_stream(user_message, session_id)` — 流式对话，串联：记忆检索 → 注入 Prompt（含当前时间 + 已知用户 + 场景活动流）→ LLM 流式 → 动作/对白分离 → 情绪解析 → 记忆提取
+- `ChatService.clear_session(session_id)` — 按 `session_id:` 前缀清所有用户的对话历史
+- `ChatService.clear_scene(session_id)` — 清场景活动流
+- `ChatService.scene_recent` — 场景活动流（`deque`，maxlen=20），跨用户共享
+- `ChatService.conversations` — key = `f"{session_id}:{user_id}"`，每人独立 10 轮历史
 
 #### `core/action_parser.py`
 - `ActionParser` — 流式状态机，支持括号跨 chunk 切分
@@ -383,9 +388,9 @@ ChatMessage {
 | `memory/short_term.py` | `ConversationStore` — 单会话 10 轮滑动窗口 |
 | `memory/database.py` | SQLite — `users` + `memories` 两张表 |
 | `memory/vector_store.py` | ChromaDB — 本地 `bge-small-zh-v1.5`，cosine 检索 |
-| `memory/extractor.py` | 规则预筛 + LLM 精提取 + `evidence` 原话验证 + `invalidate` 失效检测 |
-| `memory/retriever.py` | 语义检索 + 时间衰减 + 重要度加权，过滤 `invalidated` |
-| `memory/lifecycle.py` | TTL 清理 + 衰减（`fact`/`reflection` 豁免）+ 反思调度 |
+| `memory/extractor.py` | 权重预筛 + 双 Prompt（strong/normal）+ `evidence` 原话验证 + `invalidate` 失效检测 |
+| `memory/retriever.py` | 核心身份记忆 + 话题检索 + 近期活动，三路合并；过滤 `invalidated` |
+| `memory/lifecycle.py` | TTL 清理 + 衰减写回（`decay_applied_at` 幂等）+ 反思调度 |
 | `memory/reflection.py` | 从多条事实归纳规律，`evidence_ids` 至少 2 条真实存在 |
 | `memory/user_manager.py` | 登录选择模式，`identify_user(audio_data, session_id)` 声纹接口预留 |
 
@@ -397,9 +402,11 @@ ChatMessage {
 - 含"不/不再/其实/改成"时，检索已有记忆判断 `invalidate` / `update`
 
 **生命周期**：
-- `event` 90 天、`emotion` 30 天过期
-- `fact` / `reflection` 永不删除、不参与衰减
-- 超过 30 天未访问的 `event` / `emotion` 重要度 × 0.9
+- `event` 90 天、`emotion` 30 天过期（`importance >= 0.8` 的保护记忆不删）
+- 衰减：超过 7 天未访问，每 7 天 × 0.85，按 `days_idle // 7` 补算周期数
+- 各类型下限：`fact` 0.5 / `reflection` 0.6 / `event` 0.2 / `emotion` 0.1
+- `decay_applied_at` 保证幂等：连续两次写回，第二次不重复衰减
+- 衰减在启动时 + 每 6 小时写回库，库里 `importance` 始终是衰减后的值
 
 **记忆管理 CLI**：
 
@@ -511,18 +518,23 @@ pnpm run tauri dev
 → memory/extractor 异步提取记忆（不阻塞）
 ```
 ### 动作/对白分离
-LLM 原始输出: "唔...表情测试啊。(顿了顿，歪个头) 这样够明显么？[情绪:疑惑]"
-↓ ActionParser
-对白: "唔...表情测试啊。 这样够明显么？" → TTS
-动作: ["顿了顿，歪个头"] → 映射为 tilt_head → Live2D 参数
-情绪: "疑惑" → EMOTION_MAP 表情
 
+```
+LLM 原始输出: "唔...表情测试啊。(顿了顿，歪个头) 这样够明显么？[情绪:疑惑]"
+    ↓ ActionParser
+对白: "唔...表情测试啊。 这样够明显么？"   → TTS
+动作: ["顿了顿，歪个头"]                    → 映射为 tilt_head → Live2D 参数
+情绪: "疑惑"                                 → EMOTION_MAP 表情
+```
 
 ### 记忆生命周期
-每 6 小时：
-├── TTL 清理（event 90 天 / emotion 30 天）
-├── 衰减（未访问 > 30 天的 event/emotion 降权）
-└── 每 7 天：反思（fact+event ≥ 10 条时，归纳规律性认识）
+
+```
+启动时 + 每 6 小时：
+    ├── TTL 清理（event 90 天 / emotion 30 天）
+    ├── 衰减写回（idle >= 7 天，每周期 × 0.85，decay_applied_at 幂等）
+    └── 每 7 天：反思（fact+event ≥ 10 条时，归纳规律性认识）
+```
 
 ### 反馈回路（数据飞轮起点）
 

@@ -37,26 +37,35 @@ def get_collection():
     return _collection
 
 
-def add_vector(memory_id: str, content: str, user_id: str):
+def add_vector(
+    memory_id: str,
+    content: str,
+    user_id: str,
+    metadata: dict | None = None,
+):
     col = get_collection()
+    meta = {"user_id": user_id}
+    if metadata:
+        meta.update(metadata)
     col.add(
         ids=[memory_id],
         documents=[content],
-        metadatas=[{"user_id": user_id}],
+        metadatas=[meta],
     )
 
 
-def query_vectors(query_text: str, user_id: str, top_k: int = 5) -> list[dict]:
+def query_vectors(query_text: str, where: dict, top_k: int = 5) -> list[dict]:
     """
-    返回: [{"memory_id": ..., "content": ..., "distance": ...}, ...]
-    distance 越小越相似（cosine 距离）
+    where: ChromaDB 过滤条件
+      单条件: {"scope": "shared"}
+      多条件: {"$and": [{"subject_id": "xxx"}, {"scope": "private"}]}
     """
     col = get_collection()
     try:
         results = col.query(
             query_texts=[query_text],
             n_results=top_k,
-            where={"user_id": user_id},
+            where=where,
         )
     except Exception as e:
         print(f"[Memory] ⚠️ 向量检索失败: {e}", flush=True)
@@ -66,11 +75,13 @@ def query_vectors(query_text: str, user_id: str, top_k: int = 5) -> list[dict]:
     ids = results.get("ids", [[]])[0]
     docs = results.get("documents", [[]])[0]
     dists = results.get("distances", [[]])[0]
+    metas = results.get("metadatas", [[]])[0]
     for i, memory_id in enumerate(ids):
         out.append({
             "memory_id": memory_id,
             "content": docs[i] if i < len(docs) else "",
             "distance": dists[i] if i < len(dists) else 1.0,
+            "metadata": metas[i] if i < len(metas) else {},
         })
     return out
 
