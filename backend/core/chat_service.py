@@ -3,7 +3,6 @@
 
 import asyncio
 import uuid
-from collections import deque
 from datetime import datetime
 
 from llm.base import LLMProvider
@@ -19,10 +18,6 @@ class ChatService:
     _system_prompt: str = ""
     # key = f"{session_id}:{user_id}"
     conversations: dict[str, ConversationStore] = {}
-
-    # 场景活动流：session_id -> deque
-    scene_recent: dict[str, deque] = {}
-    SCENE_MAX = 20
 
     # ========== 配置 ==========
 
@@ -41,52 +36,13 @@ class ChatService:
     def _get_or_create_conv(cls, session_id: str, user_id: str) -> ConversationStore:
         conv_key = f"{session_id}:{user_id}"
         if conv_key not in cls.conversations:
-            cls.conversations[conv_key] = ConversationStore(
+            conv = ConversationStore(
                 max_turns=10, system_prompt=cls._system_prompt,
             )
+            conv.bind(session_id, user_id)
+            cls.conversations[conv_key] = conv
             print(f"[Chat] 🆕 新建会话: {conv_key[:16]}...", flush=True)
         return cls.conversations[conv_key]
-
-    @classmethod
-    def _append_scene(cls, session_id: str, user_id: str, user_name: str, role: str, text: str):
-        buf = cls.scene_recent.setdefault(session_id, deque(maxlen=cls.SCENE_MAX))
-        buf.append({
-            "user_id": user_id,
-            "user_name": user_name,
-            "role": role,
-            "text": text,
-            "ts": datetime.now().isoformat(),
-        })
-
-    @classmethod
-    def _build_scene_block(cls, session_id: str, current_user_id: str) -> str:
-        buf = cls.scene_recent.get(session_id)
-        if not buf:
-            return ""
-
-        try:
-            from memory.retriever import _relative_time
-        except Exception:
-            def _relative_time(_):
-                return "刚才"
-
-        lines = []
-        for item in buf:
-            if item["user_id"] == current_user_id:
-                continue
-            rel = _relative_time(item["ts"])
-            if item["role"] == "assistant":
-                lines.append(f"- [{rel}] 你（对{item['user_name']}）：{item['text'][:60]}")
-            else:
-                lines.append(f"- [{rel}] {item['user_name']}：{item['text'][:60]}")
-
-        if not lines:
-            return ""
-        return "\n\n【本场景近期活动（其他人在场时）】\n" + "\n".join(lines)
-
-    @classmethod
-    def clear_scene(cls, session_id: str):
-        cls.scene_recent.pop(session_id, None)
 
     @classmethod
     def _build_identity_prefix(
@@ -99,7 +55,6 @@ class ChatService:
         weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
         time_str = now.strftime(f"%Y-%m-%d %H:%M，{weekday}")
 
-        # 🔥 查已知用户（排除当前说话人），用 user_manager 现成接口
         try:
             all_users = user_manager.list_users()
             known_names = [
@@ -121,11 +76,6 @@ class ChatService:
             f"**不要假装认识**，自然地追问一句「（那个名字）是谁呀？」。\n"
             f"如果对方回答了身份（比如'是我朋友'），你可以记住这条关系。\n"
         )
-
-        scene_block = cls._build_scene_block(session_id, user_id)
-        if scene_block:
-            prefix += scene_block
-            prefix += "\n（近期活动里提到的人可能在同一个场景中，你可以自然地提起，不用假装不知道。）\n"
 
         return prefix
 
@@ -168,8 +118,14 @@ class ChatService:
         emotion = parser.emotion or "冷静"
         conv.add("assistant", reply)
 
-        cls._append_scene(session_id, user_id, user_name, "user", user_message)
-        cls._append_scene(session_id, user_id, user_name, "assistant", reply)
+        asyncio.create_task(
+            extractor.extract_and_store(cls._provider, user_id, user_message, reply)
+        )
+        asyncio.create_task(
+            extractor.reflect_on_self(
+                cls._provider, user_id, user_name, user_message, reply
+            )
+        )
 
         return reply, emotion, session_id
 
@@ -193,11 +149,10 @@ class ChatService:
 
         conv = cls._get_or_create_conv(session_id, user_id)
 
-        # 检索记忆（失败不影响对话）
         memory_block = ""
         try:
             memory_block = await asyncio.to_thread(
-                retriever.build_memory_block, user_message, user_id, user_name
+                retriever.build_memory_block, user_message, user_id, user_name, session_id
             )
         except Exception as e:
             print(f"[Chat] ⚠️ 记忆检索失败（继续对话）: {e}", flush=True)
@@ -208,6 +163,7 @@ class ChatService:
         conv.system_prompt = original_prompt + identity_prefix + memory_block
         if memory_block:
             print(f"[Chat] 🧠 注入记忆 {memory_block.count('- ')} 条", flush=True)
+            print(f"[Chat] 📄 memory_block:\n{memory_block}", flush=True)
         else:
             print("[Chat] 🧠 注入记忆 0 条", flush=True)
 
@@ -248,12 +204,14 @@ class ChatService:
         emotion = parser.emotion or "冷静"
         conv.add("assistant", reply)
 
-        # 写入场景活动流
-        cls._append_scene(session_id, user_id, user_name, "user", user_message)
-        cls._append_scene(session_id, user_id, user_name, "assistant", reply)
-
         asyncio.create_task(
             extractor.extract_and_store(cls._provider, user_id, user_message, reply)
+        )
+
+        asyncio.create_task(
+            extractor.reflect_on_self(
+                cls._provider, user_id, user_name, user_message, reply
+            )
         )
 
         yield {
@@ -264,19 +222,22 @@ class ChatService:
             "actions": collected_actions,
         }
 
-    # ========== 工具方法 ==========
+    @classmethod
+    async def _maybe_self_review(cls, session_id: str, user_id: str, user_name: str):
+        """断开时检查：本次会话 >= 6 轮，触发主动回看"""
+        conv_key = f"{session_id}:{user_id}"
+        conv = cls.conversations.get(conv_key)
+        if not conv or len(conv.history) < 12:
+            return
 
-    @staticmethod
-    def _parse_emotion(text: str) -> tuple:
-        emotion = "冷静"
-        if "[情绪:" in text or "[情绪：" in text:
-            text = text.replace("[情绪：", "[情绪:")
-            start = text.rfind("[情绪:") + 4
-            end = text.rfind("]", start)
-            if end > start:
-                emotion = text[start:end].strip()
-                text = text[:text.rfind("[情绪:")].strip()
-        return text, emotion
+        try:
+            await extractor.self_review(
+                cls._provider, user_id, user_name, conv.history[-12:]
+            )
+        except Exception as e:
+            print(f"[Chat] ⚠️ 主动回看失败: {e}", flush=True)
+
+    # ========== 工具方法 ==========
 
     @classmethod
     def clear_session(cls, session_id: str) -> None:

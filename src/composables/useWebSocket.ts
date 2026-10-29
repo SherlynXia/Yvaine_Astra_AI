@@ -57,20 +57,32 @@ export function useWebSocket() {
   };
 
   const listUsers = (): boolean => {
-    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) return false;
+    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
+      console.warn('[Auth] listUsers 失败: ws 未就绪', ws.value?.readyState);
+      return false;
+    }
     ws.value.send(JSON.stringify({ type: 'list_users' }));
+    console.log('[Auth] 已发送 list_users');
     return true;
   };
 
   const switchUser = (userId: string): boolean => {
-    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) return false;
+    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
+      console.warn('[Auth] switchUser 失败: ws 未就绪', ws.value?.readyState);
+      return false;
+    }
     ws.value.send(JSON.stringify({ type: 'login', userId }));
+    console.log('[Auth] 已发送 login:', userId);
     return true;
   };
 
   const createUser = (name: string): boolean => {
-    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) return false;
+    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
+      console.warn('[Auth] createUser 失败: ws 未就绪', ws.value?.readyState);
+      return false;
+    }
     ws.value.send(JSON.stringify({ type: 'create_user', name }));
+    console.log('[Auth] 已发送 create_user:', name);
     return true;
   };
 
@@ -108,16 +120,22 @@ export function useWebSocket() {
         return;
       }
 
-      wsUrl.value = url;
-      console.log('🔌 连接 WebSocket:', url);
+      const sid = getOrCreateSessionId();
+      const fullUrl = url.includes('?')
+        ? `${url}&session_id=${sid}`
+        : `${url}?session_id=${sid}`;
 
-      const socket = new WebSocket(url);
+      wsUrl.value = fullUrl;
+      console.log('🔌 连接 WebSocket:', fullUrl);
+
+      const socket = new WebSocket(fullUrl);
 
       socket.onopen = () => {
         console.log('✨ 与 Yvaine 的灵魂连接已建立');
+        ws.value = socket;
         isConnected.value = true;
         isConnecting.value = false;
-        ws.value = socket;
+
       };
 
       socket.onmessage = (event) => {
@@ -167,6 +185,15 @@ export function useWebSocket() {
 
     ws.value.send(JSON.stringify({ text }));
     return true;
+  }
+
+  function getOrCreateSessionId(): string {
+    let sid = localStorage.getItem('yvaine_session_id');
+    if (!sid) {
+      sid = crypto.randomUUID();
+      localStorage.setItem('yvaine_session_id', sid);
+    }
+    return sid;
   }
 
   onBeforeUnmount(() => {

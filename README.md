@@ -14,7 +14,7 @@
 | 后端框架 | Python FastAPI + Uvicorn |
 | LLM 对话 | DeepSeek API（默认 `deepseek-flash`）/ 本地 Ollama，流式输出 |
 | TTS 语音 | 火山引擎豆包语音合成 2.0（双向流式 + phoneme） |
-| 记忆系统 | SQLite + ChromaDB（bge-small-zh-v1.5） |
+| 记忆系统 | SQLite 六表 + ChromaDB 三 collection（bge-small-zh-v1.5 本地加载） |
 
 ---
 
@@ -39,16 +39,17 @@ Yvaine_Astra_AI/
 │   │   ├── websocket.py            # WS 单向流式
 │   │   └── bidi.py                 # 双向流式（phoneme）
 │   ├── memory/                     # 🧬 记忆层
-│   │   ├── short_term.py           # ConversationStore
-│   │   ├── database.py             # SQLite
-│   │   ├── vector_store.py         # ChromaDB
-│   │   ├── extractor.py            # 记忆提取
-│   │   ├── retriever.py            # 记忆检索
-│   │   ├── user_manager.py         # 用户 + 声纹接口占位
-│   │   ├── lifecycle.py            # TTL 清理 + 衰减 + 反思调度
-│   │   └── reflection.py           # 从多条事实归纳规律
-│   ├── feedback/                   # 📊 反馈层
-│   │   └── manager.py
+│   │   ├── short_term.py           # ConversationStore（history + summaries 内存）
+│   │   ├── summarizer.py           # 上下文压缩（写内存，不落库）
+│   │   ├── database.py             # SQLite 六表：users / user_memories / ai_reflections / ai_behaviors / conversation_history / feedback
+│   │   ├── vector_store.py         # ChromaDB 三 collection：user_memories / ai_reflections / ai_behaviors
+│   │   ├── extractor.py            # 事实提取 → user_memories；被动反思/主动回看 → ai_behaviors
+│   │   ├── reflection.py           # 用户规律反思 → ai_reflections
+│   │   ├── retriever.py            # 四路检索：用户记忆 / 反思 / 行为 / 短期记忆
+│   │   ├── lifecycle.py            # TTL + 衰减（仅 user_memories）+ 反思调度
+│   │   └── user_manager.py         # 用户管理 + 声纹接口预留
+│   ├── feedback/
+│   │   └── manager.py              # 写入 SQLite feedback 表
 │   ├── personality/
 │   │   └── system_prompt.txt
 │   ├── data/
@@ -56,7 +57,8 @@ Yvaine_Astra_AI/
 │   │   ├── memory.db               # SQLite（不提交）
 │   │   ├── chroma/                 # 向量库（不提交）
 │   │   ├── conversations/
-│   │   └── memories/
+│   │   ├── memories/
+│   │   └── .gitkeep
 │   ├── memory_cli.py               # 记忆管理 CLI
 │   ├── models/
 │   │   └── bge-small-zh/           # 本地嵌入模型（不提交 Git）
@@ -352,10 +354,9 @@ ChatMessage {
 
 #### `core/chat_service.py`
 - `ChatService.configure(provider, system_prompt)` — 注入 LLM 和人格
-- `ChatService.chat_stream(user_message, session_id)` — 流式对话，串联：记忆检索 → 注入 Prompt（含当前时间 + 已知用户 + 场景活动流）→ LLM 流式 → 动作/对白分离 → 情绪解析 → 记忆提取
+- `ChatService.chat_stream(user_message, session_id)` — 流式对话：记忆检索 → 注入 Prompt → LLM 流式 → 动作/对白分离 → 情绪解析 → 记忆提取 + 被动反思
+- `ChatService._maybe_self_review(session_id, user_id, user_name)` — 断开时若会话 ≥6 轮，触发主动回看
 - `ChatService.clear_session(session_id)` — 按 `session_id:` 前缀清所有用户的对话历史
-- `ChatService.clear_scene(session_id)` — 清场景活动流
-- `ChatService.scene_recent` — 场景活动流（`deque`，maxlen=20），跨用户共享
 - `ChatService.conversations` — key = `f"{session_id}:{user_id}"`，每人独立 10 轮历史
 
 #### `core/action_parser.py`
@@ -383,38 +384,88 @@ ChatMessage {
 
 ### 5. Memory 层
 
-| 文件 | 说明 |
-|------|------|
-| `memory/short_term.py` | `ConversationStore` — 单会话 10 轮滑动窗口 |
-| `memory/database.py` | SQLite — `users` + `memories` 两张表 |
-| `memory/vector_store.py` | ChromaDB — 本地 `bge-small-zh-v1.5`，cosine 检索 |
-| `memory/extractor.py` | 权重预筛 + 双 Prompt（strong/normal）+ `evidence` 原话验证 + `invalidate` 失效检测 |
-| `memory/retriever.py` | 核心身份记忆 + 话题检索 + 近期活动，三路合并；过滤 `invalidated` |
-| `memory/lifecycle.py` | TTL 清理 + 衰减写回（`decay_applied_at` 幂等）+ 反思调度 |
-| `memory/reflection.py` | 从多条事实归纳规律，`evidence_ids` 至少 2 条真实存在 |
-| `memory/user_manager.py` | 登录选择模式，`identify_user(audio_data, session_id)` 声纹接口预留 |
+| 文件 | 职责 |
+| :--- | :--- |
+| `short_term.py` | `ConversationStore`：本次连接内的 `history` + `summaries`（内存，断开即清） |
+| `summarizer.py` | `compress_to_memory()`：溢出窗口对话 → LLM 压缩成 2-3 句 → 追加进 `conv.summaries`（不落库） |
+| `database.py` | SQLite 六表 CRUD |
+| `vector_store.py` | ChromaDB 三 collection 读写 |
+| `extractor.py` | 事实提取 → `user_memories`；被动反思 / 主动回看 → `ai_behaviors` |
+| `reflection.py` | 用户规律反思 → `ai_reflections` |
+| `retriever.py` | 四路检索：用户记忆 / 反思 / 行为 / 短期记忆 |
+| `lifecycle.py` | TTL + 衰减（仅 `user_memories`）+ 反思调度 |
+| `user_manager.py` | 用户管理 + 声纹接口预留 |
 
-**记忆类型**：`fact` / `event` / `emotion` / `reflection` / `invalidated`。
+**六层结构，各自独立：**
 
-**提取规则**：
-- 只从用户消息提取（不含 AI 回复）
-- `evidence` 必须原样出现在用户原话中，否则丢弃
-- 含"不/不再/其实/改成"时，检索已有记忆判断 `invalidate` / `update`
+| 层 | 载体 | 存什么 | 生命周期 |
+| :--- | :--- | :--- | :--- |
+| 长期记忆·用户 | `user_memories` | `fact` / `event` / `emotion`，按 `subject_id` + `scope` 区分 | 7 天 × 0.85 衰减 + TTL |
+| 长期记忆·反思 | `ai_reflections` | AI 对某个用户的规律认知 | 不衰减、不删 |
+| 长期记忆·行为 | `ai_behaviors` | AI 对自己的行为经验（来自用户反馈 + 自我回看） | 不衰减、不删 |
+| 短期记忆 | `conversation_history` | 场景内逐字对话（跨用户） | 3 天清理 |
+| 当前上下文 | `ConversationStore.history` | 本次连接最近 10 轮 | 连接断开即清 |
+| 上下文压缩 | `ConversationStore.summaries` | 溢出窗口的摘要（内存） | 连接断开即清 |
+| 反馈数据 | `feedback` | 点赞/点踩原始数据 | 永久，用于训练 |
 
-**生命周期**：
-- `event` 90 天、`emotion` 30 天过期（`importance >= 0.8` 的保护记忆不删）
-- 衰减：超过 7 天未访问，每 7 天 × 0.85，按 `days_idle // 7` 补算周期数
-- 各类型下限：`fact` 0.5 / `reflection` 0.6 / `event` 0.2 / `emotion` 0.1
-- `decay_applied_at` 保证幂等：连续两次写回，第二次不重复衰减
-- 衰减在启动时 + 每 6 小时写回库，库里 `importance` 始终是衰减后的值
+**SQLite 表：**
 
-**记忆管理 CLI**：
+| 表 | 关键字段 | 说明 |
+| :--- | :--- | :--- |
+| `users` | `user_id`, `name`, `voiceprint` | 用户 + `ai_self` |
+| `user_memories` | `subject_id`, `scope`, `source_id`, `decay_applied_at` | 用户的事实/事件/情绪 |
+| `ai_reflections` | `user_id`, `evidence_ids` | AI 对用户的规律 |
+| `ai_behaviors` | `user_id`, `source` | `source` 区分 `user_feedback` / `self_review` |
+| `conversation_history` | `session_id`, `user_id`, `role` | 短期记忆逐字 |
+| `feedback` | `rating`, `user_message`, `ai_reply` | 训练数据源 |
+
+**ChromaDB 三个独立 collection：**
+
+| collection | 对应表 | 检索方式 |
+| :--- | :--- | :--- |
+| `user_memories` | `user_memories` | `subject_id + scope` 过滤 |
+| `ai_reflections` | `ai_reflections` | 按 `user_id` 过滤 |
+| `ai_behaviors` | `ai_behaviors` | 全局，不区分用户 |
+
+**写入规则：**
+
+- `extract_and_store` → 只写 `user_memories`（`fact`/`event`/`emotion`）
+- `reflect_on_self`（被动反思，用户评价触发）→ 写 `ai_behaviors`，`source=user_feedback`
+- `self_review`（主动回看，会话 ≥6 轮断开触发）→ 写 `ai_behaviors`，`source=self_review`
+- `generate_reflections`（每 24 小时，新增 fact+event ≥5 条触发）→ 写 `ai_reflections`
+- `save_feedback` → 写 `feedback` 表
+
+**衰减规则（仅 `user_memories`）：**
+
+- 7 天未访问，每 7 天 × 0.85，按 `decay_applied_at` 幂等
+- 下限：`fact` 0.5 / `event` 0.2 / `emotion` 0.1
+- TTL：`event` 90 天、`emotion` 30 天、`fact` 永久
+- `ai_reflections` / `ai_behaviors` **不衰减、不删**
+
+**上下文压缩：**
+
+- 触发：`ConversationStore.history` 超过 `max_turns*2 + 4` 条
+- 处理：溢出最早 4 条 → LLM 压缩成 2-3 句 → 存进 `summaries` 内存列表
+- 注入：`get_messages()` 把 `summaries` 拼成一条 system 消息，插在历史之前
+- **不落库，断开即清**
+
+**短期记忆：**
+
+- 触发：`build_memory_block` 每次对话都查
+- 查询：`conversation_history` 按 `session_id` + 最近 3 天，**不区分用户**
+- 注入：`【近期对话】` 段，显示“谁在什么时候说了什么”
+
+**迁移脚本：**
+
+```bash
+python backend/migrate_restructure.py   # memories → user_memories / ai_reflections / ai_behaviors / feedback
+python backend/migrate_chroma.py        # ChromaDB 重建三个 collection
+```
+
+**记忆管理 CLI：**
 
 ```bash
 python backend/memory_cli.py list
-python backend/memory_cli.py delete 3ba1d754
-python backend/memory_cli.py delete-keyword 牛奶
-python backend/memory_cli.py clear-user cd4ad67b
 python backend/memory_cli.py stats
 ```
 
@@ -503,37 +554,78 @@ pnpm run tauri dev
 
 ### 对话主链路（流式）
 
-
 ```
 用户输入
 → useChat.send() → WebSocket
 → core/chat_service.chat_stream()
-├── memory/retriever 检索记忆（按 user_id 隔离）→ 注入 System Prompt
-├── llm 流式生成
-└── 每满一句 → 句子切分
+    ├── memory/retriever 四路检索：
+    │   ├── user_memories：核心事实 + 话题相关（private/shared）
+    │   ├── ai_reflections：你对这个人的理解
+    │   ├── ai_behaviors：你从过往学到的经验
+    │   └── conversation_history：最近 3 天的场景对话
+    ├── ConversationStore.summaries：本次连接内的上下文压缩
+    ├── LLM 流式生成
+    └── SentenceBuffer 句子切分
 → tts/facade 逐句合成音频
 → WebSocket 推送 message + audio 片段
 → useChat 音频队列顺序播放
 → useLive2D.speakWithPhonemes 口型同步
-→ memory/extractor 异步提取记忆（不阻塞）
-```
-### 动作/对白分离
-
-```
-LLM 原始输出: "唔...表情测试啊。(顿了顿，歪个头) 这样够明显么？[情绪:疑惑]"
-    ↓ ActionParser
-对白: "唔...表情测试啊。 这样够明显么？"   → TTS
-动作: ["顿了顿，歪个头"]                    → 映射为 tilt_head → Live2D 参数
-情绪: "疑惑"                                 → EMOTION_MAP 表情
+→ 异步后处理：
+    ├── extractor.extract_and_store → user_memories
+    ├── extractor.reflect_on_self → ai_behaviors（用户评价触发）
+    └── ConversationStore.add 溢出 → summarizer.compress_to_memory → summaries（内存）
 ```
 
-### 记忆生命周期
+### 上下文压缩
 
 ```
-启动时 + 每 6 小时：
-    ├── TTL 清理（event 90 天 / emotion 30 天）
-    ├── 衰减写回（idle >= 7 天，每周期 × 0.85，decay_applied_at 幂等）
-    └── 每 7 天：反思（fact+event ≥ 10 条时，归纳规律性认识）
+ConversationStore.history 超过 24 条
+    ↓
+取最早 4 条 → LLM 压缩成 2-3 句
+    ↓
+追加到 ConversationStore.summaries（内存）
+    ↓
+下次 get_messages() 时拼成一条 system 消息
+    ↓
+连接断开 → summaries 随 ConversationStore 一起清空
+```
+
+### 主动回看
+
+```
+WebSocket 断开
+    ↓
+本次会话 ≥ 6 轮？
+    ├── 是 → extractor.self_review(最近 12 条对话)
+    │        → AI 只看自己的回复 → 写入 ai_behaviors（source=self_review）
+    └── 否 → 跳过
+```
+
+### 用户规律反思
+
+```
+每 24 小时（lifecycle_loop 每 6h，计数 4 次）
+    ↓
+should_reflect(user_id, min_new=5)：自上次反思新增 fact+event ≥5？
+    ├── 是 → generate_reflections
+    │        → LLM 从 user_memories 归纳规律
+    │        → 写入 ai_reflections（带 evidence_ids 校验）
+    └── 否 → 跳过
+```
+
+### 记忆衰减
+
+```
+每 6 小时（启动时补跑一次）
+    ↓
+solidify_decay()
+    ├── 只处理 user_memories
+    ├── 起点 = max(last_accessed, decay_applied_at)
+    ├── 7 天未访问 → 每 7 天 × 0.85
+    ├── 下限：fact 0.5 / event 0.2 / emotion 0.1
+    └── decay_applied_at 幂等，连续跑不重复衰减
+
+ai_reflections / ai_behaviors：不衰减、不删
 ```
 
 ### 反馈回路（数据飞轮起点）
@@ -541,5 +633,6 @@ LLM 原始输出: "唔...表情测试啊。(顿了顿，歪个头) 这样够明�
 用户点击 👍/👎
   → WebSocket 发送 `{type: "feedback"}`
   → feedback/manager.save_feedback()
-  → 写入 backend/data/feedback.jsonl
+  → 写入 SQLite `feedback` 表
+  → 导出命令：`database.export_feedback_jsonl()`
   → 未来：训练专属模型的原始数据

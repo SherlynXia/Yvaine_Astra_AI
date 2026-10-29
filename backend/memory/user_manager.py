@@ -53,10 +53,12 @@ def get_current_user(user_id: str = DEFAULT_USER_ID) -> dict:
 
 
 def list_users() -> list[dict]:
-    """给前端登录界面用"""
+    """返回可对话的用户列表，排除 AI 自身的记忆归属"""
     conn = database.get_conn()
     rows = conn.execute(
-        "SELECT user_id, name, last_seen_at, intimacy FROM users ORDER BY last_seen_at DESC"
+        "SELECT user_id, name, last_seen_at, intimacy FROM users "
+        "WHERE user_id != 'ai_self' "
+        "ORDER BY last_seen_at DESC"
     ).fetchall()
     return [dict(r) for r in rows]
 

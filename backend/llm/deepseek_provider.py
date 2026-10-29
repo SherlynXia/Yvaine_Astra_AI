@@ -33,7 +33,7 @@ class DeepSeekProvider(LLMProvider):
                     "model": self.model,
                     "messages": messages,
                     "temperature": temp,
-                    "max_tokens": 500,
+                    "max_tokens": 1200,
                     "stream": True,
                 },
             ) as resp:

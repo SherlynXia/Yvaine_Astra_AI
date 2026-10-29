@@ -5,6 +5,7 @@ import asyncio
 import base64
 import uuid
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 # 加载环境变量
 from dotenv import load_dotenv
@@ -67,7 +68,37 @@ class SentenceBuffer:
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ===== startup =====
+
+    # 1. 记忆生命周期任务
+    provider = ChatService._provider
+    if provider is None:
+        log("[Memory] ⚠️ LLM Provider 未配置，生命周期任务跳过")
+    else:
+        from memory.lifecycle import lifecycle_loop
+        asyncio.create_task(lifecycle_loop(provider, interval_hours=6.0))
+        log("[Memory] 🧹 生命周期任务已启动（每 6 小时）")
+
+    # 2. ChromaDB 异步预热
+    async def _warmup():
+        try:
+            from memory.vector_store import get_collection
+            await asyncio.to_thread(get_collection)
+            log("[Memory] ✅ ChromaDB 预热完成")
+        except Exception as e:
+            log(f"⚠️ ChromaDB 预热失败（首次聊天时会懒加载）: {e}")
+
+    asyncio.create_task(_warmup())
+
+    yield  # ← 应用运行中
+
+    # ===== shutdown =====
+    # 目前没有需要清理的资源，留空
+
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/")
@@ -93,28 +124,6 @@ async def test_tts_emotion():
         results[emotion] = {"status": "ok" if audio else "error", "length": len(audio) if audio else 0}
     return {"mode": TTS_MODE, "results": results}
 
-@app.on_event("startup")
-async def _startup_lifecycle():
-    from memory.lifecycle import lifecycle_loop
-    provider = ChatService._provider
-    if provider is None:
-        print("[Memory] ⚠️ LLM Provider 未配置，生命周期任务跳过", flush=True)
-        return
-    asyncio.create_task(lifecycle_loop(provider, interval_hours=6.0))
-    print("[Memory] 🧹 生命周期任务已启动（每 6 小时）", flush=True)
-
-@app.on_event("startup")
-async def _startup_warmup():
-    """ChromaDB 异步预热，不阻塞端口监听"""
-    async def _warmup():
-        try:
-            from memory.vector_store import get_collection
-            await asyncio.to_thread(get_collection)
-            log("[Memory] ✅ ChromaDB 预热完成")
-        except Exception as e:
-            log(f"⚠️ ChromaDB 预热失败（首次聊天时会懒加载）: {e}")
-
-    asyncio.create_task(_warmup())
 
 @app.get("/feedback/stats")
 async def feedback_stats():
@@ -124,7 +133,10 @@ async def feedback_stats():
 @app.websocket("/ws/chat")
 async def ws_chat(ws: WebSocket):
     await ws.accept()
-    session_id = str(uuid.uuid4())
+    session_id = ws.query_params.get("session_id") or str(uuid.uuid4())
+    current_user_id = "default" 
+    current_user_name = "对方" 
+
     log(f"✨ WebSocket 连接建立 | 会话: {session_id[:8]}...")
 
     try:
@@ -138,6 +150,8 @@ async def ws_chat(ws: WebSocket):
                 user_manager.bind_session(session_id, user_id)
                 user = user_manager.get_current_user(user_id)
                 log(f"[Auth] 登录: {user.get('name')} ({user_id[:8]})")
+                current_user_id = user_id
+                current_user_name = user.get("name") or "对方"
                 await ws.send_json({
                     "type": "login_ack",
                     "userId": user_id,
@@ -224,6 +238,7 @@ async def ws_chat(ws: WebSocket):
             pending_feedback[message_id] = {
                 "message_id": message_id,
                 "session_id": session_id,
+                "user_id": current_user_id,
                 "user_message": user_text,
                 "ai_reply": full_reply,
                 "emotion": emotion,
@@ -265,9 +280,14 @@ async def ws_chat(ws: WebSocket):
 
     except WebSocketDisconnect:
         log(f"💫 WebSocket 断开 | 会话: {session_id[:8]}...")
+        try:
+            await ChatService._maybe_self_review(
+                session_id, current_user_id, current_user_name
+            )
+        except Exception as e:
+            log(f"⚠️ 主动回看失败: {e}")
         user_manager.unbind_session(session_id)
         ChatService.clear_session(session_id)
-        ChatService.clear_scene(session_id)
     except Exception as e:
         log(f"❌ WebSocket 错误: {e}")
         user_manager.unbind_session(session_id)

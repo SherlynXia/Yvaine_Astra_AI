@@ -38,11 +38,6 @@ export function useChat(
     const unlisten = await listen<number>('python-started', (event) => {
       console.log('✅ Python 后端已启动，端口:', event.payload);
       connect();
-      // 连接成功后，请求用户列表并默认登录
-      setTimeout(() => {
-        wsListUsers();
-        wsSwitchUser('default');
-      }, 500);
     });
     
     // 也监听 python-error 事件
@@ -66,6 +61,20 @@ export function useChat(
     return () => {
       unlisten();
     };
+  });
+
+  let hasLoggedIn = false;
+
+  watch(isConnected, (connected) => {
+    if (connected && !hasLoggedIn) {
+      hasLoggedIn = true;
+      console.log('[Auth] WebSocket 已连接，请求用户列表并登录');
+      wsListUsers();
+      wsSwitchUser('default');
+    }
+    if (!connected) {
+      hasLoggedIn = false;   // 断线后允许重连再登录
+    }
   });
 
   interface UserInfo {
