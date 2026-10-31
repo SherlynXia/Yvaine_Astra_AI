@@ -2,6 +2,7 @@
 """ChromaDB 向量存储：user_memories / ai_reflections / ai_behaviors 三个独立 collection"""
 from __future__ import annotations
 
+import threading
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from pathlib import Path
@@ -10,6 +11,7 @@ MODEL_PATH = Path(__file__).parent.parent / "models" / "bge-small-zh"
 CHROMA_PATH = Path(__file__).parent.parent / "data" / "chroma"
 CHROMA_PATH.mkdir(parents=True, exist_ok=True)
 
+_init_lock = threading.Lock()
 _client: chromadb.PersistentClient | None = None
 _embedding_fn = None
 _collections: dict[str, any] = {}
@@ -35,13 +37,19 @@ def _get_collection(name: str):
     global _client
     if name in _collections:
         return _collections[name]
-    if _client is None:
-        _client = chromadb.PersistentClient(path=str(CHROMA_PATH))
-    fn = _get_embedding_fn()
-    col = _client.get_or_create_collection(name=name, embedding_function=fn, metadata={"hnsw:space": "cosine"})
-    print(f"[Memory] 📚 collection [{name}] 已就绪: {col.count()} 条", flush=True)
-    _collections[name] = col
-    return col
+    with _init_lock:
+        # 双重检查：拿到锁后再看一次
+        if name in _collections:
+            return _collections[name]
+        if _client is None:
+            _client = chromadb.PersistentClient(path=str(CHROMA_PATH))
+        fn = _get_embedding_fn()
+        col = _client.get_or_create_collection(
+            name=name, embedding_function=fn, metadata={"hnsw:space": "cosine"}
+        )
+        print(f"[Memory] 📚 collection [{name}] 已就绪: {col.count()} 条", flush=True)
+        _collections[name] = col
+        return col
 
 
 def _add(name: str, id_: str, content: str, metadata: dict):
@@ -94,6 +102,9 @@ def query_user_memories(query_text: str, where: dict, top_k: int = 5) -> list[di
 def delete_user_memory(memory_id: str):
     _delete("user_memories", memory_id)
 
+def update_user_memory(memory_id: str, content: str):
+    """更新记忆正文（Chroma 会重新 embed）"""
+    _get_collection("user_memories").update(ids=[memory_id], documents=[content])
 
 # ========== ai_reflections ==========
 
@@ -137,3 +148,20 @@ def query_behaviors(query_text: str, top_k: int = 5) -> list[dict]:
 
 def delete_behavior(behavior_id: str):
     _delete("ai_behaviors", behavior_id)
+
+# ========== workspace_items ==========
+
+def add_workspace_item(item_id: str, content: str, topic_id: str, item_type: str = "setting"):
+    _add("workspace_items", item_id, content, {"topic_id": topic_id, "item_type": item_type})
+
+
+def query_workspace_items(query_text: str, topic_id: str, top_k: int = 3) -> list[dict]:
+    return _query("workspace_items", query_text, {"topic_id": topic_id}, top_k)
+
+
+def update_workspace_item(item_id: str, content: str):
+    _get_collection("workspace_items").update(ids=[item_id], documents=[content])
+
+
+def delete_workspace_item(item_id: str):
+    _delete("workspace_items", item_id)

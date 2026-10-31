@@ -14,7 +14,7 @@
 | 后端框架 | Python FastAPI + Uvicorn |
 | LLM 对话 | DeepSeek API（默认 `deepseek-flash`）/ 本地 Ollama，流式输出 |
 | TTS 语音 | 火山引擎豆包语音合成 2.0（双向流式 + phoneme） |
-| 记忆系统 | SQLite 六表 + ChromaDB 三 collection（bge-small-zh-v1.5 本地加载） |
+| 记忆系统 | SQLite 十一表 + ChromaDB 四 collection（bge-small-zh-v1.5 本地加载） |
 
 ---
 
@@ -41,12 +41,14 @@ Yvaine_Astra_AI/
 │   ├── memory/                     # 🧬 记忆层
 │   │   ├── short_term.py           # ConversationStore（history + summaries 内存）
 │   │   ├── summarizer.py           # 上下文压缩（写内存，不落库）
-│   │   ├── database.py             # SQLite 六表：users / user_memories / ai_reflections / ai_behaviors / conversation_history / feedback
-│   │   ├── vector_store.py         # ChromaDB 三 collection：user_memories / ai_reflections / ai_behaviors
-│   │   ├── extractor.py            # 事实提取 → user_memories；被动反思/主动回看 → ai_behaviors
-│   │   ├── reflection.py           # 用户规律反思 → ai_reflections
-│   │   ├── retriever.py            # 四路检索：用户记忆 / 反思 / 行为 / 短期记忆
-│   │   ├── lifecycle.py            # TTL + 衰减（仅 user_memories）+ 反思调度
+│   │   ├── database.py             # SQLite 十一表（含 workspace + relationship）
+│   │   ├── vector_store.py         # ChromaDB 四 collection（+ workspace_items）
+│   │   ├── extractor.py            # 事实提取 + memory_layer 分流 + 关系抽取
+│   │   ├── reflection.py           # 用户规律反思（含衰减/强化）
+│   │   ├── retriever.py            # 七段检索：核心事实/相关/理解/经验/工作话题/关系/短期
+│   │   ├── lifecycle.py            # TTL + 衰减 + 话题归档 + 反思调度
+│   │   ├── workspace.py            # 工作记忆：话题匹配 + 素材写入 + 归档
+│   │   ├── relationship.py         # 关系网：AI↔用户三维 + 用户↔用户融合 + 隐私梯度
 │   │   └── user_manager.py         # 用户管理 + 声纹接口预留
 │   ├── feedback/
 │   │   └── manager.py              # 写入 SQLite feedback 表
@@ -345,8 +347,8 @@ ChatMessage {
 - 服务端 → 客户端（音频片段）：`{"type": "audio", "audioBase64": "...", "phonemes": [...], "sequenceIndex": 0, "isLastChunk": false}`
 
 **startup 钩子**：
-- `_startup_lifecycle`：启动 `lifecycle_loop`，每 6 小时跑一次 TTL 清理 / 衰减写回 / 反思调度
-- `_startup_warmup`：异步预热 ChromaDB（`asyncio.create_task`，不阻塞端口监听）
+- `_startup_lifecycle`：启动 `lifecycle_loop`，每 6h 跑一次 TTL 清理 / 衰减写回 / 话题归档 / 反思调度
+- `_startup_warmup`：异步预热 ChromaDB（4 个 collection，串行 + 加锁，`asyncio.create_task` 不阻塞端口）
 
 ---
 
@@ -384,96 +386,232 @@ ChatMessage {
 
 ### 5. Memory 层
 
+#### 文件职责
+
 | 文件 | 职责 |
 | :--- | :--- |
 | `short_term.py` | `ConversationStore`：本次连接内的 `history` + `summaries`（内存，断开即清） |
-| `summarizer.py` | `compress_to_memory()`：溢出窗口对话 → LLM 压缩成 2-3 句 → 追加进 `conv.summaries`（不落库） |
-| `database.py` | SQLite 六表 CRUD |
-| `vector_store.py` | ChromaDB 三 collection 读写 |
-| `extractor.py` | 事实提取 → `user_memories`；被动反思 / 主动回看 → `ai_behaviors` |
-| `reflection.py` | 用户规律反思 → `ai_reflections` |
-| `retriever.py` | 四路检索：用户记忆 / 反思 / 行为 / 短期记忆 |
-| `lifecycle.py` | TTL + 衰减（仅 `user_memories`）+ 反思调度 |
+| `summarizer.py` | 溢出窗口对话 → LLM 摘要 → 追加进 `conv.summaries`（不落库） |
+| `database.py` | SQLite 十一表 CRUD + 迁移 |
+| `vector_store.py` | ChromaDB 四 collection 读写（含 workspace_items） |
+| `extractor.py` | 事实提取 → `user_memories`；`memory_layer` 分流到 workspace；`mentioned_relations` 观察；被动反思 → `ai_behaviors` |
+| `reflection.py` | 用户规律反思 → `ai_reflections`，含衰减/强化（C 方案） |
+| `retriever.py` | 七段检索：核心事实 / 相关记忆 / 对用户的理解 / 学到的经验 / 工作话题 / 关系 / 短期记忆 |
+| `lifecycle.py` | TTL + 衰减（仅 user_memories）+ 话题归档 + 反思调度 |
+| `workspace.py` | 工作记忆：话题匹配（LLM）+ 素材去重 + TTL 归档 + pending 迁移 |
+| `relationship.py` | 关系网：三维更新 + 融合逻辑 + 隐私梯度 + AI 观察信号 |
 | `user_manager.py` | 用户管理 + 声纹接口预留 |
 
-**六层结构，各自独立：**
+#### 存储层结构（九层 + 3 辅助）
 
 | 层 | 载体 | 存什么 | 生命周期 |
 | :--- | :--- | :--- | :--- |
-| 长期记忆·用户 | `user_memories` | `fact` / `event` / `emotion`，按 `subject_id` + `scope` 区分 | 7 天 × 0.85 衰减 + TTL |
-| 长期记忆·反思 | `ai_reflections` | AI 对某个用户的规律认知 | 不衰减、不删 |
-| 长期记忆·行为 | `ai_behaviors` | AI 对自己的行为经验（来自用户反馈 + 自我回看） | 不衰减、不删 |
+| 长期记忆·用户 | `user_memories` | `fact`/`event`/`emotion`，按 `subject_id`+`scope` 区分 | 7 天 × 0.85 衰减 + TTL + `expires_at` |
+| 长期记忆·反思 | `ai_reflections` | AI 对某个用户的规律认知 | 不删，`importance < 0.4` 休眠不注入 |
+| 长期记忆·行为 | `ai_behaviors` | AI 对自己的行为经验 | 不衰减、不删 |
+| 工作记忆·话题 | `workspace_topics` | 项目/话题容器（title / summary / ttl_days / status） | TTL 到期归档（软归档，可恢复） |
+| 工作记忆·素材 | `workspace_items` | 话题内的设定/角色/情节/想法/草稿 | 跟随话题，话题归档时一起沉眠 |
+| 关系网·AI↔用户 | `ai_user_relationships` | 三维（familiarity / trust / intimacy / stage） | 每轮更新，不衰减 |
+| 关系网·用户↔用户 | `user_user_relationships` | 融合后的关系（relation_type / closeness / is_mutual） | 每轮观察更新，不删 |
+| 关系网·单方声明 | `relation_claims` | "谁说过和谁是什么关系" | 解除关系时删，不衰减 |
 | 短期记忆 | `conversation_history` | 场景内逐字对话（跨用户） | 3 天清理 |
 | 当前上下文 | `ConversationStore.history` | 本次连接最近 10 轮 | 连接断开即清 |
-| 上下文压缩 | `ConversationStore.summaries` | 溢出窗口的摘要（内存） | 连接断开即清 |
-| 反馈数据 | `feedback` | 点赞/点踩原始数据 | 永久，用于训练 |
+| 上下文压缩 | `ConversationStore.summaries` | 溢出窗口摘要 | 连接断开即清 |
+| 反馈数据 | `feedback` | 👍/👎 原始数据 | 永久，训练用 |
 
-**SQLite 表：**
+#### SQLite 十一表
 
 | 表 | 关键字段 | 说明 |
 | :--- | :--- | :--- |
 | `users` | `user_id`, `name`, `voiceprint` | 用户 + `ai_self` |
-| `user_memories` | `subject_id`, `scope`, `source_id`, `decay_applied_at` | 用户的事实/事件/情绪 |
-| `ai_reflections` | `user_id`, `evidence_ids` | AI 对用户的规律 |
-| `ai_behaviors` | `user_id`, `source` | `source` 区分 `user_feedback` / `self_review` |
+| `user_memories` | `subject_id`, `scope`, `source_id`, `decay_applied_at`, `expires_at` | 用户的事实/事件/情绪 |
+| `ai_reflections` | `user_id`, `evidence_ids`, `importance` | AI 对用户的规律，importance < 0.4 休眠 |
+| `ai_behaviors` | `user_id`, `source` | `source` 区分 `user_feedback`/`self_review` |
+| `workspace_topics` | `user_id`, `title`, `summary`, `ttl_days`, `status`, `last_touched_at` | 工作话题容器 |
+| `workspace_items` | `topic_id`, `item_type`, `content` | 话题素材（setting/character/plot/idea/draft） |
+| `ai_user_relationships` | `user_id`, `familiarity`, `trust`, `intimacy`, `stage` | AI ↔ 每个用户的三维 |
+| `user_user_relationships` | `user_a`, `user_b`, `relation_type`, `closeness`, `confidence`, `is_mutual`, `observed_sentiment`, `observed_mentions` | 用户间关系（融合后） |
+| `relation_claims` | `claimant_id`, `target_id`, `relation_type`, `stated_closeness` | 单方声明（多对多，融合前） |
 | `conversation_history` | `session_id`, `user_id`, `role` | 短期记忆逐字 |
 | `feedback` | `rating`, `user_message`, `ai_reply` | 训练数据源 |
 
-**ChromaDB 三个独立 collection：**
+#### ChromaDB 四 collection
 
 | collection | 对应表 | 检索方式 |
 | :--- | :--- | :--- |
-| `user_memories` | `user_memories` | `subject_id + scope` 过滤 |
-| `ai_reflections` | `ai_reflections` | 按 `user_id` 过滤 |
+| `user_memories` | `user_memories` | `subject_id + scope + type` 过滤 |
+| `ai_reflections` | `ai_reflections` | 按 `user_id` 过滤，`importance < 0.4` 不注入 |
 | `ai_behaviors` | `ai_behaviors` | 全局，不区分用户 |
+| `workspace_items` | `workspace_items` | 按 `topic_id` 过滤（话题内去重） |
 
-**写入规则：**
+#### 写入规则
 
-- `extract_and_store` → 只写 `user_memories`（`fact`/`event`/`emotion`）
+- `extract_and_store`：
+  - `memory_layer=user` → `user_memories`（fact/event/emotion）
+  - `memory_layer=workspace` → `workspace.record_item()`（话题匹配 + 素材去重）
+  - `relation_info` 有值时 → `relation_claims` + `user_user_relationships`（融合后）
+  - `mentioned_relations` 有值时 → `user_user_relationships.observed_sentiment`（滑动平均）
 - `reflect_on_self`（被动反思，用户评价触发）→ 写 `ai_behaviors`，`source=user_feedback`
 - `self_review`（主动回看，会话 ≥6 轮断开触发）→ 写 `ai_behaviors`，`source=self_review`
-- `generate_reflections`（每 24 小时，新增 fact+event ≥5 条触发）→ 写 `ai_reflections`
-- `save_feedback` → 写 `feedback` 表
+- `generate_reflections`（lifecycle 每轮都尝试，`should_reflect` 按自上次反思后新增量 ≥ 5）→ 写 `ai_reflections`，相近的衰减旧的
+- `relationship.update_after_turn`（每轮对话同步）→ 更新 `ai_user_relationships`（familiarity+1，情绪词 intimacy+2，口头表扬/批评 trust±1）
+- `save_feedback` → 写 `feedback` 表（**不接关系网 trust**，独立数据）
 
-**衰减规则（仅 `user_memories`）：**
+#### 衰减规则（仅 `user_memories`）
 
 - 7 天未访问，每 7 天 × 0.85，按 `decay_applied_at` 幂等
 - 下限：`fact` 0.5 / `event` 0.2 / `emotion` 0.1
 - TTL：`event` 90 天、`emotion` 30 天、`fact` 永久
+- `expires_at` 到期（精确时间点，无 importance 保护）→ 硬删
 - `ai_reflections` / `ai_behaviors` **不衰减、不删**
 
-**上下文压缩：**
+#### 反思衰减（C 方案）
+
+- `dist < 0.1`（几乎重复）→ `importance +0.05`（强化）
+- `0.1 ≤ dist < 0.25`（相近冲突）→ 旧反思 `importance -0.15`
+- `importance < 0.4` 的反思休眠：**留在库中不删，检索时不注入**
+- 休眠的反思被再次强化（`dist < 0.1`）可复活
+
+#### 上下文压缩
 
 - 触发：`ConversationStore.history` 超过 `max_turns*2 + 4` 条
 - 处理：溢出最早 4 条 → LLM 压缩成 2-3 句 → 存进 `summaries` 内存列表
 - 注入：`get_messages()` 把 `summaries` 拼成一条 system 消息，插在历史之前
 - **不落库，断开即清**
 
-**短期记忆：**
+#### 短期记忆
 
 - 触发：`build_memory_block` 每次对话都查
-- 查询：`conversation_history` 按 `session_id` + 最近 3 天，**不区分用户**
-- 注入：`【近期对话】` 段，显示“谁在什么时候说了什么”
+- 查询：`conversation_history` 按 `session_id` + 最近 3 天，**不区分用户**，从新到旧累加（`max 800 字符`）
+- 注入：`【近期对话】` 段，显示"谁在什么时候说了什么"
 
-**迁移脚本：**
+#### 长期记忆：工作记忆（workspace）
+
+工作记忆与长期记忆**物理隔离**，存"当前正在创作/讨论的项目素材"，不污染 `user_memories`。
+
+**分流判据**（`_COMMON_OUTPUT_SPEC` 里的 `memory_layer`）：
+
+- `user`：关于人本身的稳定属性、喜好、长期目标、情绪
+- `workspace`：当前创作/讨论的素材、设定、情节、角色
+- **拿不准 → workspace**（工作记忆可恢复，长期记忆清理代价高）
+- strong 模式（用户说"记住…"）→ 强制 `user`
+
+**话题匹配**：
+
+- `_match_or_create_topic()`：LLM 从 active 话题里找匹配的，或新建
+- 无 active 话题时跳过 LLM 直接新建（省一次 API）
+- 话题内去重：`dist < 0.1` 视为重复，touch 不新增
+
+**工作记忆生命周期**：
+
+- 默认 `ttl_days = 7`，可被对话改写（30 天 / 90 天）
+- 每次素材写入 → `last_touched_at = now`（自动续期）
+- `lifecycle` 每 6h 扫 `last_touched_at + ttl_days < now` → `status='archived'`
+- **归档是软归档**，用户重提话题时 `reactivate_workspace_topic` 恢复
+- 注入时最多展示 2 个 active 话题 + 每个话题最近 3 条素材
+
+**注入格式**（`retriever.build_memory_block` 第 5 段）：
+
+
+**历史素材迁移**：`migrate_cleanup.py` 导出 `pending_workspace.json` → `workspace.import_pending()` 或手动 `migrate_pending_workspace.py` 定向插入。
+
+#### 长期记忆：关系网（relationships）
+
+分两层：**AI ↔ 每个用户**（一对一）+ **用户 ↔ 用户**（社交图）。
+
+**AI ↔ 用户（`ai_user_relationships`）**
+
+| 维度 | 含义 | 更新时机 |
+| :--- | :--- | :--- |
+| `familiarity` | 聊过多少次 | 每轮 +1 |
+| `trust` | 用户对 AI 的态度 | 对话中口头表扬 +1 / 批评 -1 |
+| `intimacy` | 用户愿不愿意交心 | 情绪词 +2，写入 private 记忆 +1 |
+
+分级：`stranger`（0-15）/ `acquaintance`（15-35）/ `friend`（35-60）/ `close`（60-80）/ `intimate`（80+）
+
+**feedback 👍/👎 不接 trust**——feedback 是训练数据，和关系网独立。
+
+**用户 ↔ 用户（社交图）**
+
+分两层表：
+
+- **`relation_claims`**（单方声明）：`claimant_id` → `target_id`，谁说过什么关系，独立记录
+- **`user_user_relationships`**（融合后）：无向关系 + `closeness` + `is_mutual`
+
+**融合公式**：
+双方声明 + 类型一致 → closeness = 双方均值 × 0.9，mutual=1
+单方声明 → closeness = stated × (0.4 + 0.5×min(1, mentions/10)) + observed×0.05
+只有观察（无声明） → mentions < 5 时为 0；否则 max(0, observed) × 0.3
+类型冲突 → relation=acquaintance, mutual=0
+
+
+**关键设计**：
+
+- **单方声明不能全信**：刚说完"是我朋友"，closeness 只有 0.20，看不到对方任何 shared 记忆
+- **需要观察积累**：10 次正向互动后接近 0.49，才能看 fact；要双方确认才一跃到 0.81
+- **只有观察不算数**：即使提及 10 次，无声明时 closeness 上限 0.30（防 AI 自己猜错）
+- **观察用滑动平均**：`0.8×旧 + 0.2×新`，单次"夏凛好烦"不会让 closeness 暴跌
+
+**双向确认**：
+
+`_build_relation_hint` 两个触发场景：
+
+1. **优先**：有人声称过和当前用户有关系，但当前用户还没确认 → 问当前用户
+2. 用户提到 X 但关系未知 → 问用户
+
+AI 问「你和夏凛是什么关系呀？」→ 缓存到 `_relation_pending[session_id]` → 用户答「朋友」（只说词，没主语）→ `_try_resolve_pending` 补上主语 → 写 claim + 融合。
+
+**每个 session 每个名字只问一次**（`_relation_asked`）。
+
+**隐私梯度**：
+
+AI 能不能把「B 的某条记忆」告诉「正在对话的 A」= **三重判定**：
+
+| 条件 | 说明 |
+| :--- | :--- |
+| `confidence ≥ 0.5` | AI 确定有关系 |
+| `closeness ≥ 类型门槛` | A-B 关系够铁 |
+| `intimacy ≥ 类型门槛` | A-AI 关系够熟 |
+
+**类型门槛**：
+
+| 记忆 type | 别人的 shared 门槛（closeness） |
+| :--- | :--- |
+| `fact` | 0.25 |
+| `event` | 0.50 |
+| `emotion` | 0.70 |
+
+**自己的记忆门槛**（intimacy）：fact+private 15 / event+private 20 / emotion+private 30。`shared` 基本无门槛。
+
+**别人的 private：永不注入**（除非 B 明确授权给 A，当前不实现）。
+
+**注入标注**：可见时前缀 `[你]` 或 `[夏凛·公开]`，让 LLM 知道来源。
+
+#### 迁移脚本
 
 ```bash
+# 记忆系统重构
 python backend/migrate_restructure.py   # memories → user_memories / ai_reflections / ai_behaviors / feedback
 python backend/migrate_chroma.py        # ChromaDB 重建三个 collection
+
+# 记忆库整理（跑前先 dry-run 看计划）
+python backend/migrate_cleanup.py              # 删过期/重复/一次性，导出 workspace 素材
+python backend/migrate_cleanup.py --apply      # 实际执行（自动备份 memory.db）
+
+# 工作记忆历史素材迁移
+python backend/migrate_pending_workspace.py             # dry-run
+python backend/migrate_pending_workspace.py --apply
 ```
 
-**记忆管理 CLI：**
-
-```bash
-python backend/memory_cli.py list
-python backend/memory_cli.py stats
-```
+#### 记忆管理 CLI
+python backend/memory_cli.py list      # 列出 user_memories（可能仍指向旧表，待修复）
+python backend/memory_cli.py stats     # 统计
 
 ### 6. Feedback 层
 
 | 文件 | 说明 |
 |------|------|
-| `feedback/manager.py` | `save_feedback()` / `get_feedback_stats()`，写入 `data/feedback.jsonl` |
+| `feedback/manager.py` | `save_feedback()` / `get_feedback_stats()`，写入 SQLite `feedback` 表 |
 
 ---
 
@@ -558,11 +696,18 @@ pnpm run tauri dev
 用户输入
 → useChat.send() → WebSocket
 → core/chat_service.chat_stream()
-    ├── memory/retriever 四路检索：
-    │   ├── user_memories：核心事实 + 话题相关（private/shared）
-    │   ├── ai_reflections：你对这个人的理解
+    ├── memory/retriever 七段检索：
+    │   ├── user_memories：核心事实 + 话题相关（按隐私梯度过滤）
+    │   ├── ai_reflections：你对这个人的理解（importance ≥ 0.4）
     │   ├── ai_behaviors：你从过往学到的经验
-    │   └── conversation_history：最近 3 天的场景对话
+    │   ├── workspace：当前工作话题（active，按 user_id 严格隔离）
+    │   ├── relationship：你和他的关系（三维 + 他认识的人）
+    │   └── conversation_history：最近 3 天，从新到旧取（max 800 字符）
+    ├── 记忆提取分流：
+    │   ├── user_memories：关于人的稳定信息
+    │   ├── workspace：当前项目素材
+    │   ├── relation_claims + user_user_relationships：关系声明
+    │   └── user_user_relationships.observed_sentiment：情感观察
     ├── ConversationStore.summaries：本次连接内的上下文压缩
     ├── LLM 流式生成
     └── SentenceBuffer 句子切分
@@ -571,7 +716,9 @@ pnpm run tauri dev
 → useChat 音频队列顺序播放
 → useLive2D.speakWithPhonemes 口型同步
 → 异步后处理：
-    ├── extractor.extract_and_store → user_memories
+    ├── relationship.update_after_turn → ai_user_relationships（三维）
+    ├── relationship.try_auto_detect_relation → relation_claims（"X 是我朋友"）
+    ├── extractor.extract_and_store → user_memories / workspace / relation_claims
     ├── extractor.reflect_on_self → ai_behaviors（用户评价触发）
     └── ConversationStore.add 溢出 → summarizer.compress_to_memory → summaries（内存）
 ```
@@ -604,12 +751,12 @@ WebSocket 断开
 ### 用户规律反思
 
 ```
-每 24 小时（lifecycle_loop 每 6h，计数 4 次）
+每次 lifecycle 循环（6h）都会尝试
     ↓
 should_reflect(user_id, min_new=5)：自上次反思新增 fact+event ≥5？
     ├── 是 → generate_reflections
     │        → LLM 从 user_memories 归纳规律
-    │        → 写入 ai_reflections（带 evidence_ids 校验）
+    │        → 写入 ai_reflections（dist<0.1 强化旧的，0.1-0.25 衰减旧的）
     └── 否 → 跳过
 ```
 
@@ -636,3 +783,21 @@ ai_reflections / ai_behaviors：不衰减、不删
   → 写入 SQLite `feedback` 表
   → 导出命令：`database.export_feedback_jsonl()`
   → 未来：训练专属模型的原始数据
+
+
+---
+
+## 已知问题 / 待办
+
+**已修复（历史）：**
+- ChromaDB 并行预热 race → 改为串行 + `_get_collection` 加锁
+- 短期记忆从旧到新截断 → 改为从新到旧累加
+- prompt 花括号未双写导致 `KeyError`
+- `_parse_json_array` 截断整批丢 → 改为保留前面完整对象
+
+**待办（backlog）：**
+- `memory_cli.py` 适配新表
+- 声纹识别（`user_manager` 接口已预留）
+- 主动发言（`proactive/loop.py`，让"明天提醒"类事件真正兑现）
+- workspace 跨用户协作（`subject_ids` 共享）
+- 记忆库索引优化（`_daily_count` 改 range 查询，`solidify_decay` 加 WHERE 过滤）

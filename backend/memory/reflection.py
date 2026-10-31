@@ -106,14 +106,45 @@ async def generate_reflections(provider: LLMProvider, user_id: str, min_memories
             if row:
                 valid_ids.append(row["memory_id"])
 
+        # 证据不足时降级：用当前 fact+event 里最近的几条兜底
         if len(valid_ids) < 2:
-            print(f"[Reflection] ⏭️ 跳过: 支撑证据不足（{len(valid_ids)} 条）: {content}", flush=True)
+            fallback = [m["memory_id"] for m in facts[-3:]]
+            print(
+                f"[Reflection] ⚠️ evidence 不足（{len(valid_ids)} 条），降级用最近 {len(fallback)} 条 fact",
+                flush=True,
+            )
+            valid_ids = fallback
+
+        if not valid_ids:
+            print(f"[Reflection] ⏭️ 跳过: 完全无 evidence: {content}", flush=True)
             continue
 
+        # 和已有反思比对：完全重复→强化；相近→衰减旧的；全新→新增
         similar = vector_store.query_reflections(content, user_id, top_k=1)
-        if similar and similar[0]["distance"] < 0.15:
-            print(f"[Reflection] ⏭️ 跳过: 重复", flush=True)
-            continue
+        if similar:
+            dist = similar[0]["distance"]
+            old_id = similar[0]["memory_id"]
+
+            # 几乎一样：强化旧反思，不新增
+            if dist < 0.1:
+                old_imp, new_imp = database.reinforce_reflection(old_id, delta=0.05)
+                print(
+                    f"[Reflection] 📈 强化: {old_imp:.2f} → {new_imp:.2f} (dist={dist:.3f})",
+                    flush=True,
+                )
+                continue
+
+            # 相近但可能冲突：衰减旧反思（不删），新反思正常写入
+            if dist < 0.25:
+                old_imp, new_imp = database.decay_reflection(old_id, delta=0.15)
+                print(
+                    f"[Reflection] 📉 旧反思衰减: {old_imp:.2f} → {new_imp:.2f} "
+                    f"(dist={dist:.3f})，新反思写入中",
+                    flush=True,
+                )
+                # 不 continue，继续走下面的新增逻辑
+
+            # dist >= 0.25：全新反思，直接新增
 
         try:
             imp = float(item.get("importance", 0.8))

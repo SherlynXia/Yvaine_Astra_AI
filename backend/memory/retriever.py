@@ -2,7 +2,7 @@
 """检索：用户记忆（private + shared）/ AI 反思 / AI 行为 / 短期记忆"""
 
 from datetime import datetime
-from . import database, vector_store
+from . import database, vector_store, workspace, relationship
 
 SCOPE_WEIGHT = {
     "private": 1.0,
@@ -104,9 +104,30 @@ def retrieve_user_memories(
 
     scored.sort(key=lambda x: x["score"], reverse=True)
 
+    # 隐私梯度：按当前 intimacy 和记忆类型/scope 过滤
+    current_intimacy = relationship.get_intimacy(current_user_id)
+
     result = []
     total_chars = 0
     for item in scored:
+        visible, prefix = relationship.check_memory_visibility(
+            {
+                "type": item.get("type", "fact"),
+                "scope": item.get("scope", "private"),
+                "subject_id": item.get("subject_id", ""),
+            },
+            current_user_id,
+            current_intimacy,
+        )
+        if not visible:
+            print(
+                f"[Retriever] 🔒 隐私过滤: {item['content'][:30]} "
+                f"(type={item.get('type')}, scope={item.get('scope')})",
+                flush=True,
+            )
+            continue
+
+        item["prefix"] = prefix
         if total_chars + len(item["content"]) > max_chars:
             break
         result.append(item)
@@ -133,6 +154,13 @@ def retrieve_reflections(query: str, current_user_id: str, top_k: int = 3) -> li
             "SELECT * FROM ai_reflections WHERE reflection_id = ?", (c["memory_id"],)
         ).fetchone()
         if not row:
+            continue
+        # 衰减到 0.4 以下的反思不注入（保留在库，可复活）
+        if row["importance"] < 0.4:
+            print(
+                f"[Retriever] 💤 休眠反思跳过: imp={row['importance']:.2f} | {row['content'][:30]}",
+                flush=True,
+            )
             continue
         result.append(dict(row))
         if len(result) >= top_k:
@@ -169,7 +197,7 @@ def _short_term_block(
     session_id: str,
     current_user_id: str,
     days: int = 3,
-    max_chars: int = 500,
+    max_chars: int = 800,
 ) -> str:
     if not session_id:
         return ""
@@ -181,13 +209,15 @@ def _short_term_block(
     if not rows:
         return ""
 
+    # 从新到旧累加（rows 是旧→新，reversed 后变新→旧），优先保留最近的
     lines = []
     total = 0
-    for r in rows:
+    for r in reversed(rows):
         name = r["user_name"] or (r["user_id"][:8] if r["user_id"] != "ai_self" else "渊鸢")
         speaker = name if r["role"] == "user" else "渊鸢"
+        content = r["content"].replace("\n", " ").replace("\r", " ").strip()
         rel = _relative_time(r["created_at"])
-        line = f"- [{rel}] {speaker}：{r['content'][:60]}"
+        line = f"- [{rel}] {speaker}：{content[:60]}"
         if total + len(line) > max_chars:
             break
         lines.append(line)
@@ -195,6 +225,8 @@ def _short_term_block(
 
     if not lines:
         return ""
+    # 反转回对话顺序（旧→新）
+    lines.reverse()
     return "【近期对话】\n" + "\n".join(lines)
 
 
@@ -206,12 +238,14 @@ def build_memory_block(
     session_id: str = "",
 ) -> str:
     """
-    四段独立注入：
+    七段独立注入：
       1. 关于用户的核心事实
       2. 话题相关用户记忆
-      3. 你对这个人的理解（反思）
+      3. 你对这个人的理解（反思，importance ≥ 0.4）
       4. 你学到的经验（行为）
-      5. 近期对话（短期记忆）
+      5. 当前工作话题（workspace）
+      6. 你和他的关系（三维 + 他认识的人）
+      7. 近期对话（短期记忆）
     """
     parts = []
 
@@ -230,16 +264,11 @@ def build_memory_block(
         if m["memory_id"] not in core_ids
     ]
     if topic:
-        own = [m for m in topic if m["scope"] == "private"]
-        shared = [m for m in topic if m["scope"] == "shared"]
-        if own:
-            parts.append("【相关记忆】\n" + "\n".join(
-                f"- [{_relative_time(m['created_at'])}] {m['content']}" for m in own
-            ))
-        if shared:
-            parts.append("【公共信息】\n" + "\n".join(
-                f"- [{_relative_time(m['created_at'])}] {m['content']}" for m in shared
-            ))
+        # 统一注入，每条带来源前缀（[你] 或 [夏凛·公开]）
+        parts.append("【相关记忆】\n" + "\n".join(
+            f"- [{_relative_time(m['created_at'])}] {m.get('prefix', '')} {m['content']}"
+            for m in topic
+        ))
 
     # 3. AI 对这个人的理解
     reflections = retrieve_reflections(query, current_user_id)
@@ -255,11 +284,21 @@ def build_memory_block(
             f"- {b['content']}" for b in behaviors
         ))
 
-    # 5. 短期记忆
+    # 5. 当前工作话题（workspace，按 user_id 严格隔离）
+    ws_block = workspace.get_workspace_block(current_user_id)
+    if ws_block:
+        parts.append(ws_block)
+
+    # 6. 关系状态（AI ↔ 用户 + 该用户认识的人）
+    rel_block = relationship.get_relationship_block(current_user_id, current_user_name)
+    if rel_block:
+        parts.append(rel_block)
+
+    # 7. 短期记忆
     short_term = _short_term_block(session_id, current_user_id)
     if short_term:
         parts.append(short_term)
 
     if not parts:
-        return ""
+        return ""      
     return "\n\n" + "\n\n".join(parts) + "\n"

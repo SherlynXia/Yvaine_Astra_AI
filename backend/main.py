@@ -34,6 +34,15 @@ from llm import OllamaProvider, DeepSeekProvider
 # ========== 句子切分 ==========
 _SENTENCE_ENDINGS = "。！？!?."
 
+# ========== 情绪映射 ==========
+EMOTION_MAP = {
+    "开心": "happy", "温柔": "neutral", "傲娇": "neutral",
+    "冷静": "neutral", "担忧": "sad", "困倦": "neutral",
+    "好奇": "surprised", "欣慰": "happy", "无奈": "sad",
+    "生气": "angry", "难过": "sad", "惊讶": "surprised",
+    "疑惑": "neutral", "调皮": "happy",
+}
+
 # ========== 待评分消息缓存 ==========
 pending_feedback: dict[str, dict] = {}
 _MAX_PENDING = 100  # 最多缓存 100 条未评分消息
@@ -73,22 +82,22 @@ async def lifespan(app: FastAPI):
     # ===== startup =====
 
     # 1. 记忆生命周期任务
-    provider = ChatService._provider
-    if provider is None:
+    if ChatService._provider is None:
         log("[Memory] ⚠️ LLM Provider 未配置，生命周期任务跳过")
     else:
         from memory.lifecycle import lifecycle_loop
-        asyncio.create_task(lifecycle_loop(provider, interval_hours=6.0))
+        asyncio.create_task(lifecycle_loop(ChatService._provider, interval_hours=6.0))
         log("[Memory] 🧹 生命周期任务已启动（每 6 小时）")
 
     # 2. ChromaDB 异步预热
     async def _warmup():
         try:
-            from memory.vector_store import get_collection
-            await asyncio.to_thread(get_collection)
-            log("[Memory] ✅ ChromaDB 预热完成")
+            from memory import vector_store
+            for name in ("user_memories", "ai_reflections", "ai_behaviors", "workspace_items"):
+                await asyncio.to_thread(vector_store._get_collection, name)
+            log("[Memory] ✅ ChromaDB 预热完成（4 个 collection）")
         except Exception as e:
-            log(f"⚠️ ChromaDB 预热失败（首次聊天时会懒加载）: {e}")
+            log(f"[Memory] ⚠️ ChromaDB 预热失败（首次聊天时会懒加载）: {e}")
 
     asyncio.create_task(_warmup())
 
@@ -203,12 +212,19 @@ async def ws_chat(ws: WebSocket):
             if not user_text:
                 continue
 
+            # 同步当前用户（防止未登录直接聊的场景）
+            if current_user_id == "default":
+                current_user_id = await user_manager.identify_user(session_id=session_id)
+                user = user_manager.get_current_user(current_user_id)
+                current_user_name = user.get("name") or "对方"
+
             log(f"[User] {user_text}")
 
             # 流式接收 + 句子切分
             sentence_buf = SentenceBuffer()
             sentences: list[str] = []
             emotion = "冷静"
+            actions: list[str] = []
             message_id = str(uuid.uuid4())
 
             async for event in ChatService.chat_stream(user_text, session_id):
@@ -225,14 +241,7 @@ async def ws_chat(ws: WebSocket):
             log(f"[渊鸢] {full_reply[:50]}... | 情绪: {emotion}")
 
             # 情绪映射
-            emotion_map = {
-                "开心": "happy", "温柔": "neutral", "傲娇": "neutral",
-                "冷静": "neutral", "担忧": "sad", "困倦": "neutral",
-                "好奇": "surprised", "欣慰": "happy", "无奈": "sad",
-                "生气": "angry", "难过": "sad", "惊讶": "surprised",
-                "疑惑": "neutral", "调皮": "happy",
-            }
-            tts_emotion = emotion_map.get(emotion, "")
+            tts_emotion = EMOTION_MAP.get(emotion, "")
 
             # 缓存反馈上下文
             pending_feedback[message_id] = {
@@ -244,7 +253,7 @@ async def ws_chat(ws: WebSocket):
                 "emotion": emotion,
                 "tts_emotion": tts_emotion,
             }
-            if len(pending_feedback) > _MAX_PENDING:
+            while len(pending_feedback) > _MAX_PENDING:
                 oldest = next(iter(pending_feedback))
                 del pending_feedback[oldest]
 

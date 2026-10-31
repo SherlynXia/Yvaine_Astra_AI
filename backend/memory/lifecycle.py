@@ -82,6 +82,13 @@ def run_lifecycle_once() -> dict:
     if purged:
         print(f"[Memory] 🧹 清理旧对话历史: {purged} 条", flush=True)
 
+    # 新增：清理 expires_at 已过期的事件（无条件删，不看 importance）
+    expired_ids = database.purge_expired_memories()
+    for mid in expired_ids:
+        vector_store.delete_user_memory(mid)
+    if expired_ids:
+        print(f"[Memory] 🧹 清理过期事件: {len(expired_ids)} 条", flush=True)
+
     rows = conn.execute(
         "SELECT memory_id, type, importance, last_accessed, created_at FROM user_memories"
     ).fetchall()
@@ -106,7 +113,7 @@ def run_lifecycle_once() -> dict:
 
     conn.commit()
     decayed = solidify_decay()
-    return {"deleted": deleted, "decayed": decayed, "purged": purged}
+    return {"deleted": deleted, "decayed": decayed, "purged": purged, "expired": len(expired_ids)}
 
 
 async def lifecycle_loop(provider, interval_hours: float = 6.0):
@@ -117,24 +124,25 @@ async def lifecycle_loop(provider, interval_hours: float = 6.0):
     except Exception as e:
         print(f"[Memory] ⚠️ 启动生命周期失败: {e}", flush=True)
 
-    reflection_counter = 0
     while True:
         try:
             result = await asyncio.to_thread(run_lifecycle_once)
-            if result["deleted"] or result["decayed"]:
+            if result["deleted"] or result["decayed"] or result["expired"] or result.get("archived_topics"):
                 print(
-                    f"[Memory] 🧹 生命周期: 清理 {result['deleted']}，衰减 {result['decayed']}",
+                    f"[Memory] 🧹 生命周期: 清理 {result['deleted']}，衰减 {result['decayed']}，"
+                    f"过期 {result['expired']}，归档话题 {result.get('archived_topics', 0)}",
                     flush=True,
                 )
 
-            reflection_counter += 1
-            if reflection_counter >= 4:   # 4 × 6h = 24h
-                reflection_counter = 0
-                users = database.get_conn().execute(
-                    "SELECT DISTINCT user_id FROM user_memories WHERE user_id != 'ai_self'"
-                ).fetchall()
-                for (uid,) in users:
+            # 每轮都尝试反思，should_reflect 内部按「自上次反思后的新增量」判断，天然幂等
+            users = database.get_conn().execute(
+                "SELECT DISTINCT user_id FROM user_memories WHERE user_id != 'ai_self'"
+            ).fetchall()
+            for (uid,) in users:
+                try:
                     await generate_reflections(provider, uid)
+                except Exception as e:
+                    print(f"[Reflection] ⚠️ 用户 {uid[:8]} 反思失败: {e}", flush=True)
 
         except Exception as e:
             print(f"[Memory] ⚠️ 生命周期失败: {e}", flush=True)
