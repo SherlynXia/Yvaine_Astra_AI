@@ -366,6 +366,33 @@ async def _llm_merge(provider: LLMProvider, old_content: str, new_content: str) 
         print(f"[Memory] ⚠️ LLM 合并失败: {e}", flush=True)
         return None
 
+async def _llm_consolidate(
+    provider: LLMProvider,
+    old_contents: list[str],
+    new_content: str,
+) -> str | None:
+    """多条相近旧记忆 + 新记忆 → 一条综合记忆。失败返回 None。"""
+    if not old_contents:
+        return None
+    old_text = "\n".join(f"- {c}" for c in old_contents)
+    prompt = (
+        "下面几条记忆说的是相近的事，请合并成一条。\n"
+        "要求：保留所有关键信息（时间、人物、细节、数字），去掉重复，30字以内，"
+        "直接输出合并后的句子，不要解释、不要引号、不要前缀。\n\n"
+        f"旧记忆：\n{old_text}\n\n新内容：{new_content}\n\n合并结果："
+    )
+    try:
+        raw = await provider.chat(
+            [{"role": "user", "content": prompt}], temperature=0.2
+        )
+        merged = (raw or "").strip().strip('"').strip("「」").strip()
+        if not merged or len(merged) < 5:
+            return None
+        return merged[:120]
+    except Exception as e:
+        print(f"[Memory] ⚠️ 多条整合 LLM 失败: {e}", flush=True)
+        return None
+
 def _daily_count(user_id: str) -> int:
     from datetime import timedelta
     conn = database.get_conn()
@@ -720,21 +747,90 @@ async def extract_and_store(provider: LLMProvider, user_id: str, user_message: s
             else:
                 print(f"[Memory] ⚠️ 找不到目标记忆: {target_id}", flush=True)
 
-        # 检索候选：多取几条，按 type 过滤，避免 fact/event 互相误伤
+        # ===== 检索候选：放宽到 0.25，允许多条一起整合 =====
         similar = vector_store.query_user_memories(
             content,
             where={"$and": [{"subject_id": subject_id}, {"scope": scope}]},
-            top_k=3,
+            top_k=5,
         )
-        candidate = None
-        for c in similar:
-            if c["metadata"].get("type") == mem_type:
-                candidate = c
-                break
+        candidates = [
+            c for c in similar
+            if c["metadata"].get("type") == mem_type and c["distance"] < 0.25
+        ]
+        candidates.sort(key=lambda c: c["distance"])
 
-        if candidate:
-            dist = candidate["distance"]
-            existing_id = candidate["memory_id"]
+        if candidates:
+            min_dist = candidates[0]["distance"]
+
+            # ---- 多条相近：删旧 → LLM 综合 → insert 新 ----
+            if len(candidates) >= 2:
+                old_contents = []
+                old_expires = []
+                for c in candidates:
+                    old = database.get_user_memory(c["memory_id"])
+                    if old:
+                        old_contents.append(old["content"])
+                        if old.get("expires_at"):
+                            old_expires.append(old["expires_at"])
+
+                merged = await _llm_consolidate(provider, old_contents, content)
+
+                if merged:
+                    # 删除旧记忆（sqlite + chroma）
+                    for c in candidates:
+                        conn.execute(
+                            "DELETE FROM user_memories WHERE memory_id = ?",
+                            (c["memory_id"],),
+                        )
+                        vector_store.delete_user_memory(c["memory_id"])
+                    conn.commit()
+
+                    # 取最晚的过期时间
+                    final_expires = expires_at
+                    if old_expires:
+                        latest_old = max(old_expires)
+                        if not final_expires or latest_old > final_expires:
+                            final_expires = latest_old
+
+                    new_id = database.insert_user_memory(
+                        user_id=user_id,
+                        mem_type=mem_type,
+                        content=merged,
+                        importance=importance,
+                        subject_id=subject_id,
+                        scope=scope,
+                        source_id=source_id,
+                        expires_at=final_expires,
+                    )
+                    vector_store.add_user_memory(
+                        new_id, merged, user_id,
+                        metadata={
+                            "subject_id": subject_id,
+                            "scope": scope,
+                            "source_id": source_id,
+                            "type": mem_type,
+                        },
+                    )
+                    saved += 1
+                    print(
+                        f"[Memory] 🔀 多条整合: {len(candidates)} 条 → {merged[:50]}",
+                        flush=True,
+                    )
+                    continue
+
+                # LLM 失败降级：追加到最近一条，不删其余
+                old = database.get_user_memory(candidates[0]["memory_id"])
+                if old and content not in old["content"]:
+                    fallback = old["content"] + "；" + content
+                    database.update_memory_content(candidates[0]["memory_id"], fallback)
+                    vector_store.update_user_memory(candidates[0]["memory_id"], fallback)
+                    print(f"[Memory] 🔀 多条整合降级追加: {fallback[:80]}", flush=True)
+                database.touch_user_memory(candidates[0]["memory_id"])
+                continue
+
+            # ---- 单条候选 ----
+            dist = min_dist
+            existing_id = candidates[0]["memory_id"]
 
             # 完全相同：只 touch
             if dist < 0.08:
@@ -742,44 +838,41 @@ async def extract_and_store(provider: LLMProvider, user_id: str, user_message: s
                 print(f"[Memory] ⏭️ 跳过: 完全相同 (dist={dist:.3f})", flush=True)
                 continue
 
-            # 高度相似：LLM 重写合并 + 强化权重
-            if dist < 0.15:
-                old = database.get_user_memory(existing_id)
-                if old and content not in old["content"]:
-                    merged = await _llm_merge(provider, old["content"], content)
-                    if merged and merged != old["content"]:
-                        database.update_memory_content(existing_id, merged)
-                        vector_store.update_user_memory(existing_id, merged)
-                        print(
-                            f"[Memory] 🔀 LLM 合并: {old['content'][:30]} + {content[:30]} → {merged[:50]}",
-                            flush=True,
-                        )
-                    else:
-                        # LLM 失败/无变化 → 降级追加，不丢新内容
-                        fallback = old["content"] + "；" + content
-                        database.update_memory_content(existing_id, fallback)
-                        vector_store.update_user_memory(existing_id, fallback)
-                        print(f"[Memory] 🔀 追加(降级): {fallback[:80]}", flush=True)
+            # 相近：LLM 重写合并 + 强化
+            old = database.get_user_memory(existing_id)
+            if old and content not in old["content"]:
+                merged = await _llm_merge(provider, old["content"], content)
+                if merged and merged != old["content"]:
+                    database.update_memory_content(existing_id, merged)
+                    vector_store.update_user_memory(existing_id, merged)
+                    print(
+                        f"[Memory] 🔀 LLM 合并: {old['content'][:30]} + "
+                        f"{content[:30]} → {merged[:50]}",
+                        flush=True,
+                    )
+                else:
+                    fallback = old["content"] + "；" + content
+                    database.update_memory_content(existing_id, fallback)
+                    vector_store.update_user_memory(existing_id, fallback)
+                    print(f"[Memory] 🔀 追加(降级): {fallback[:80]}", flush=True)
 
-                if expires_at:
-                    old_exp = old.get("expires_at") if old else None
-                    if not old_exp or old_exp < expires_at:
-                        conn.execute(
-                            "UPDATE user_memories SET expires_at = ? WHERE memory_id = ?",
-                            (expires_at, existing_id),
-                        )
-                        conn.commit()
+            if expires_at:
+                old_exp = old.get("expires_at") if old else None
+                if not old_exp or old_exp < expires_at:
+                    conn.execute(
+                        "UPDATE user_memories SET expires_at = ? WHERE memory_id = ?",
+                        (expires_at, existing_id),
+                    )
+                    conn.commit()
 
-                old_imp, new_imp = database.reinforce_user_memory(
-                    existing_id, delta=0.1, reset_decay=True
-                )
-                print(
-                    f"[Memory] 📈 强化: {old_imp:.2f} → {new_imp:.2f} (dist={dist:.3f})",
-                    flush=True,
-                )
-                continue
-
-            # dist >= 0.15：不合并，fall through 走 insert（新记忆正常落库）
+            old_imp, new_imp = database.reinforce_user_memory(
+                existing_id, delta=0.1, reset_decay=True
+            )
+            print(
+                f"[Memory] 📈 强化: {old_imp:.2f} → {new_imp:.2f} (dist={dist:.3f})",
+                flush=True,
+            )
+            continue
 
         memory_id = database.insert_user_memory(
             user_id=user_id,

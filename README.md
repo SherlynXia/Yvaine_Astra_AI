@@ -51,7 +51,8 @@ Yvaine_Astra_AI/
 │   │   ├── relationship.py         # 关系网：AI↔用户三维 + 用户↔用户融合 + 隐私梯度
 │   │   └── user_manager.py         # 用户管理 + 声纹接口预留
 │   ├── feedback/
-│   │   └── manager.py              # 写入 SQLite feedback 表
+│   │   ├── manager.py              # 手动反馈 + 自动熵筛选入口
+│   │   └── entropy.py              # 对话价值熵计算与分级筛网
 │   ├── personality/
 │   │   └── system_prompt.txt
 │   ├── data/
@@ -394,7 +395,7 @@ ChatMessage {
 | `summarizer.py` | 溢出窗口对话 → LLM 摘要 → 追加进 `conv.summaries`（不落库） |
 | `database.py` | SQLite 十一表 CRUD + 迁移 |
 | `vector_store.py` | ChromaDB 四 collection 读写（含 workspace_items） |
-| `extractor.py` | 事实提取 → `user_memories`；`memory_layer` 分流到 workspace；`mentioned_relations` 观察；被动反思 → `ai_behaviors` |
+| `extractor.py` | 事实提取 → `user_memories`（含相近融合：单条 LLM 合并 / 多条整合重写）；`memory_layer` 分流到 workspace；`mentioned_relations` 观察；被动反思 → `ai_behaviors` |
 | `reflection.py` | 用户规律反思 → `ai_reflections`，含衰减/强化（C 方案） |
 | `retriever.py` | 七段检索：核心事实 / 相关记忆 / 对用户的理解 / 学到的经验 / 工作话题 / 关系 / 短期记忆 |
 | `lifecycle.py` | TTL + 衰减（仅 user_memories）+ 话题归档 + 反思调度 |
@@ -417,7 +418,7 @@ ChatMessage {
 | 短期记忆 | `conversation_history` | 场景内逐字对话（跨用户） | 3 天清理 |
 | 当前上下文 | `ConversationStore.history` | 本次连接最近 10 轮 | 连接断开即清 |
 | 上下文压缩 | `ConversationStore.summaries` | 溢出窗口摘要 | 连接断开即清 |
-| 反馈数据 | `feedback` | 👍/👎 原始数据 | 永久，训练用 |
+| 反馈数据 | `feedback` | 👍/👎 手动 + 熵筛自动候选 | 永久，训练用 |
 
 #### SQLite 十一表
 
@@ -433,7 +434,7 @@ ChatMessage {
 | `user_user_relationships` | `user_a`, `user_b`, `relation_type`, `closeness`, `confidence`, `is_mutual`, `observed_sentiment`, `observed_mentions` | 用户间关系（融合后） |
 | `relation_claims` | `claimant_id`, `target_id`, `relation_type`, `stated_closeness` | 单方声明（多对多，融合前） |
 | `conversation_history` | `session_id`, `user_id`, `role` | 短期记忆逐字 |
-| `feedback` | `rating`, `user_message`, `ai_reply` | 训练数据源 |
+| `feedback` | `rating`, `entropy_score`, `value_tier`, `user_message`, `ai_reply` | 训练数据源（手动 + 自动熵筛） |
 
 #### ChromaDB 四 collection
 
@@ -455,7 +456,21 @@ ChatMessage {
 - `self_review`（主动回看，会话 ≥6 轮断开触发）→ 写 `ai_behaviors`，`source=self_review`
 - `generate_reflections`（lifecycle 每轮都尝试，`should_reflect` 按自上次反思后新增量 ≥ 5）→ 写 `ai_reflections`，相近的衰减旧的
 - `relationship.update_after_turn`（每轮对话同步）→ 更新 `ai_user_relationships`（familiarity+1，情绪词 intimacy+2，口头表扬/批评 trust±1）
-- `save_feedback` → 写 `feedback` 表（**不接关系网 trust**，独立数据）
+- `save_feedback` → 写 `feedback` 表（**不接关系网 trust**，独立数据），`rating='good'|'bad'`、`value_tier='manual'`
+- `save_auto_candidate`（每轮对话结束，`main.py` 的 `ws_chat` 里调用）→ `entropy.compute_entropy_score()` 打分，`high`/`medium` 写入 `feedback`（`rating='auto'`，带 `entropy_score` / `value_tier`），`low`/`drop` 丢弃
+
+#### 记忆融合（`user_memories`）
+
+写入前检索同 `subject_id` + `scope` + `type` 的相近候选（`top_k=5`）：
+
+| distance | 行为 |
+| :--- | :--- |
+| `dist < 0.08` | 完全相同 → 只 touch，不新增 |
+| `0.08 ≤ dist < 0.25`，仅 1 条候选 | LLM 重写合并（`_llm_merge`）→ 更新旧记忆 + 强化 importance |
+| `0.08 ≤ dist < 0.25`，≥2 条候选 | 删除旧记忆 → LLM 综合（`_llm_consolidate`）→ 写入一条新记忆 |
+| `dist ≥ 0.25` | 作为新记忆插入 |
+
+LLM 调用失败 → 降级为追加（`旧内容；新内容`），不丢内容。
 
 #### 衰减规则（仅 `user_memories`）
 
@@ -604,14 +619,16 @@ python backend/migrate_pending_workspace.py --apply
 ```
 
 #### 记忆管理 CLI
-python backend/memory_cli.py list      # 列出 user_memories（可能仍指向旧表，待修复）
-python backend/memory_cli.py stats     # 统计
+python backend/memory_cli.py list                          # 列出 user_memories
+python backend/memory_cli.py stats                         # 统计
+python backend/memory_cli.py list-nearby --threshold 0.25  # 列出相近记忆对（验证融合效果）
 
 ### 6. Feedback 层
 
 | 文件 | 说明 |
 |------|------|
-| `feedback/manager.py` | `save_feedback()` / `get_feedback_stats()`，写入 SQLite `feedback` 表 |
+| `feedback/manager.py` | `save_feedback()` / `save_auto_candidate()` / `get_feedback_stats()`，写入 SQLite `feedback` 表 |
+| `feedback/entropy.py` | `compute_entropy_score()` / `_is_low_info()`，对话熵计算与分级筛网（high / medium / low / drop） |
 
 ---
 
@@ -720,6 +737,7 @@ pnpm run tauri dev
     ├── relationship.try_auto_detect_relation → relation_claims（"X 是我朋友"）
     ├── extractor.extract_and_store → user_memories / workspace / relation_claims
     ├── extractor.reflect_on_self → ai_behaviors（用户评价触发）
+    ├── feedback.manager.save_auto_candidate → feedback（自动熵筛候选，rating='auto'）
     └── ConversationStore.add 溢出 → summarizer.compress_to_memory → summaries（内存）
 ```
 
@@ -777,11 +795,25 @@ ai_reflections / ai_behaviors：不衰减、不删
 
 ### 反馈回路（数据飞轮起点）
 
+【手动链路】
 用户点击 👍/👎
   → WebSocket 发送 `{type: "feedback"}`
   → feedback/manager.save_feedback()
-  → 写入 SQLite `feedback` 表
-  → 导出命令：`database.export_feedback_jsonl()`
+  → 写入 SQLite `feedback` 表（rating='good'|'bad', value_tier='manual'）
+
+【自动链路】
+每轮对话结束
+  → main.py 的 ws_chat 调用 feedback/manager.save_auto_candidate()
+  → entropy.compute_entropy_score() 打分（香农熵 + 词汇丰富度 + 行为信号 + 回复深度）
+  → tier=high/medium → 写入 feedback（rating='auto'，带 entropy_score / value_tier）
+  → tier=low/drop → 丢弃（低信息量寒暄直接过滤）
+
+【导出】
+  SELECT user_message, ai_reply, emotion
+  FROM feedback
+  WHERE rating='auto' AND value_tier='high'
+  ORDER BY entropy_score DESC;
+
   → 未来：训练专属模型的原始数据
 
 
@@ -793,10 +825,9 @@ ai_reflections / ai_behaviors：不衰减、不删
 - ChromaDB 并行预热 race → 改为串行 + `_get_collection` 加锁
 - 短期记忆从旧到新截断 → 改为从新到旧累加
 - prompt 花括号未双写导致 `KeyError`
-- `_parse_json_array` 截断整批丢 → 改为保留前面完整对象
+- `insert_feedback` 误用不存在的 `feedback_id` 列 → 改为 `id AUTOINCREMENT` + `cur.lastrowid`
 
 **待办（backlog）：**
-- `memory_cli.py` 适配新表
 - 声纹识别（`user_manager` 接口已预留）
 - 主动发言（`proactive/loop.py`，让"明天提醒"类事件真正兑现）
 - workspace 跨用户协作（`subject_ids` 共享）

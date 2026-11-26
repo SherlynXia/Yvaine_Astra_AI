@@ -466,14 +466,23 @@ def insert_feedback(
     emotion: str,
     tts_emotion: str,
     rating: str,
-):
+    entropy_score: float | None = None,
+    value_tier: str = "manual",
+) -> int:
     conn = get_conn()
-    conn.execute(
-        "INSERT INTO feedback (message_id, session_id, user_id, user_message, ai_reply, emotion, tts_emotion, rating, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (message_id, session_id, user_id, user_message, ai_reply, emotion, tts_emotion, rating, _now()),
+    cur = conn.execute(
+        "INSERT INTO feedback "
+        "(message_id, session_id, user_id, user_message, ai_reply, "
+        " emotion, tts_emotion, rating, entropy_score, value_tier, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            message_id, session_id, user_id, user_message, ai_reply,
+            emotion, tts_emotion, rating, entropy_score, value_tier,
+            _now(),
+        ),
     )
     conn.commit()
+    return cur.lastrowid
 
 
 def get_feedback_stats() -> dict:

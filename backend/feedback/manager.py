@@ -1,18 +1,14 @@
 # backend/feedback/manager.py
-"""用户反馈管理：写入 SQLite feedback 表"""
+"""用户反馈管理：手动反馈 + 自动熵筛选候选。"""
 
-from datetime import datetime
 from memory import database
+from .entropy import compute_entropy_score
 
 
 def save_feedback(context: dict, rating: str) -> bool:
-    """
-    context: message_id, session_id, user_message, ai_reply, emotion, tts_emotion
-    rating: 'good' | 'bad'
-    """
+    """手动反馈，保持原行为，rating 只能是 good/bad。"""
     if rating not in ("good", "bad"):
         return False
-
     try:
         database.insert_feedback(
             message_id=context.get("message_id", ""),
@@ -23,11 +19,58 @@ def save_feedback(context: dict, rating: str) -> bool:
             emotion=context.get("emotion", ""),
             tts_emotion=context.get("tts_emotion", ""),
             rating=rating,
+            entropy_score=None,
+            value_tier="manual",
         )
         return True
     except Exception as e:
-        print(f"[Feedback] ❌ 写入失败: {e}", flush=True)
+        print(f"[Feedback] ❌ 手动反馈写入失败: {e}", flush=True)
         return False
+
+
+def save_auto_candidate(context: dict) -> dict:
+    """
+    每轮对话都调用：先算熵，再走筛网。
+    返回打分结果，方便调用方打日志；低价值/丢弃的不写库。
+    """
+    um = context.get("user_message", "") or ""
+    ar = context.get("ai_reply", "") or ""
+
+    result = compute_entropy_score(um, ar)
+    score = result["score"]
+    tier = result["tier"]
+
+    # 筛网：drop 和 low 都不进候选池
+    if tier in ("drop", "low"):
+        print(
+            f"[Feedback] 🧹 筛除 tier={tier} score={score:.3f} "
+            f"| {um[:40]!r}",
+            flush=True,
+        )
+        return result
+
+    try:
+        database.insert_feedback(
+            message_id=context.get("message_id", ""),
+            session_id=context.get("session_id", ""),
+            user_id=context.get("user_id", "default"),
+            user_message=um,
+            ai_reply=ar,
+            emotion=context.get("emotion", ""),
+            tts_emotion=context.get("tts_emotion", ""),
+            rating="auto",
+            entropy_score=score,
+            value_tier=tier,
+        )
+        print(
+            f"[Feedback] ✅ 候选 tier={tier} score={score:.3f} "
+            f"metrics={result['metrics']} | {um[:40]!r}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[Feedback] ❌ 自动候选写入失败: {e}", flush=True)
+
+    return result
 
 
 def get_feedback_stats() -> dict:

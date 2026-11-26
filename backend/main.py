@@ -28,7 +28,7 @@ def log(msg: str):
 from tts import TTSService, TTS_MODE, TTSWebSocketService, TTSBidirectionalService, TTSResult
 from core.chat_service import ChatService
 from memory import user_manager
-from feedback.manager import save_feedback, get_feedback_stats
+from feedback.manager import save_feedback, save_auto_candidate, get_feedback_stats
 from llm import OllamaProvider, DeepSeekProvider
 
 # ========== 句子切分 ==========
@@ -244,7 +244,7 @@ async def ws_chat(ws: WebSocket):
             tts_emotion = EMOTION_MAP.get(emotion, "")
 
             # 缓存反馈上下文
-            pending_feedback[message_id] = {
+            feedback_context = {
                 "message_id": message_id,
                 "session_id": session_id,
                 "user_id": current_user_id,
@@ -253,9 +253,13 @@ async def ws_chat(ws: WebSocket):
                 "emotion": emotion,
                 "tts_emotion": tts_emotion,
             }
+            pending_feedback[message_id] = feedback_context
             while len(pending_feedback) > _MAX_PENDING:
                 oldest = next(iter(pending_feedback))
                 del pending_feedback[oldest]
+
+            # 自动熵筛选：每条对话都打分，过筛的写入 feedback 候选池
+            save_auto_candidate(feedback_context)
 
             # 发送完整文本（前端一次性显示）
             await ws.send_json({
