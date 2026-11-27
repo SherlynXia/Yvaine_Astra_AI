@@ -434,7 +434,7 @@ ChatMessage {
 | `user_user_relationships` | `user_a`, `user_b`, `relation_type`, `closeness`, `confidence`, `is_mutual`, `observed_sentiment`, `observed_mentions` | 用户间关系（融合后） |
 | `relation_claims` | `claimant_id`, `target_id`, `relation_type`, `stated_closeness` | 单方声明（多对多，融合前） |
 | `conversation_history` | `session_id`, `user_id`, `role` | 短期记忆逐字 |
-| `feedback` | `rating`, `entropy_score`, `value_tier`, `user_message`, `ai_reply` | 训练数据源（手动 + 自动熵筛） |
+| `feedback` | `manual_rating`, `entropy_score`, `value_tier`, `user_message`, `ai_reply` | 训练数据源（自动熵筛 + 人工评价，所有对话入库） |
 
 #### ChromaDB 四 collection
 
@@ -456,8 +456,8 @@ ChatMessage {
 - `self_review`（主动回看，会话 ≥6 轮断开触发）→ 写 `ai_behaviors`，`source=self_review`
 - `generate_reflections`（lifecycle 每轮都尝试，`should_reflect` 按自上次反思后新增量 ≥ 5）→ 写 `ai_reflections`，相近的衰减旧的
 - `relationship.update_after_turn`（每轮对话同步）→ 更新 `ai_user_relationships`（familiarity+1，情绪词 intimacy+2，口头表扬/批评 trust±1）
-- `save_feedback` → 写 `feedback` 表（**不接关系网 trust**，独立数据），`rating='good'|'bad'`、`value_tier='manual'`
-- `save_auto_candidate`（每轮对话结束，`main.py` 的 `ws_chat` 里调用）→ `entropy.compute_entropy_score()` 打分，`high`/`medium` 写入 `feedback`（`rating='auto'`，带 `entropy_score` / `value_tier`），`low`/`drop` 丢弃
+- `save_auto_candidate`（每轮对话结束，`main.py` 的 `ws_chat` 里调用）→ `entropy.compute_entropy_score()` 打分，**所有对话都入库**（`value_tier` 记录 `high`/`medium`/`low`），人工救回时直接 `UPDATE manual_rating`，无需补插
+- `save_feedback`（人工 👍/👎）→ 按 `message_id` upsert：已有自动行 `UPDATE manual_rating`，无行 `INSERT`（**不接关系网 trust**，独立数据）
 
 #### 记忆融合（`user_memories`）
 
@@ -596,7 +596,7 @@ AI 能不能把「B 的某条记忆」告诉「正在对话的 A」= **三重判
 | `event` | 0.50 |
 | `emotion` | 0.70 |
 
-**自己的记忆门槛**（intimacy）：fact+private 15 / event+private 20 / emotion+private 30。`shared` 基本无门槛。
+**自己的记忆**：对本人始终可见，不设 intimacy 门槛。隐私梯度只约束“B 的记忆能不能给正在对话的 A 看”。
 
 **别人的 private：永不注入**（除非 B 明确授权给 A，当前不实现）。
 
@@ -628,7 +628,7 @@ python backend/memory_cli.py list-nearby --threshold 0.25  # 列出相近记忆�
 | 文件 | 说明 |
 |------|------|
 | `feedback/manager.py` | `save_feedback()` / `save_auto_candidate()` / `get_feedback_stats()`，写入 SQLite `feedback` 表 |
-| `feedback/entropy.py` | `compute_entropy_score()` / `_is_low_info()`，对话熵计算与分级筛网（high / medium / low / drop） |
+| `feedback/entropy.py` | `compute_entropy_score()` / `_is_low_info()` / `_frag_repeat_penalty()`，对话熵计算与分级筛网（high / medium / low）；碎片化和重复惩罚对 user_message 和 ai_reply 都生效，防止“短句堆叠但字符熵高”被误判为 high |
 
 ---
 
@@ -737,7 +737,7 @@ pnpm run tauri dev
     ├── relationship.try_auto_detect_relation → relation_claims（"X 是我朋友"）
     ├── extractor.extract_and_store → user_memories / workspace / relation_claims
     ├── extractor.reflect_on_self → ai_behaviors（用户评价触发）
-    ├── feedback.manager.save_auto_candidate → feedback（自动熵筛候选，rating='auto'）
+    ├── feedback.manager.save_auto_candidate → feedback（自动熵筛，value_tier 记录分级，所有对话入库）
     └── ConversationStore.add 溢出 → summarizer.compress_to_memory → summaries（内存）
 ```
 
@@ -795,24 +795,29 @@ ai_reflections / ai_behaviors：不衰减、不删
 
 ### 反馈回路（数据飞轮起点）
 
-【手动链路】
-用户点击 👍/👎
-  → WebSocket 发送 `{type: "feedback"}`
-  → feedback/manager.save_feedback()
-  → 写入 SQLite `feedback` 表（rating='good'|'bad', value_tier='manual'）
-
-【自动链路】
+【自动链路（每轮必跑）】
 每轮对话结束
   → main.py 的 ws_chat 调用 feedback/manager.save_auto_candidate()
-  → entropy.compute_entropy_score() 打分（香农熵 + 词汇丰富度 + 行为信号 + 回复深度）
-  → tier=high/medium → 写入 feedback（rating='auto'，带 entropy_score / value_tier）
-  → tier=low/drop → 丢弃（低信息量寒暄直接过滤）
+  → entropy.compute_entropy_score() 打分
+     （字符熵 + 长度 + 词汇丰富度 + 行为信号 + 回复深度 − 碎片化惩罚 − 重复惩罚）
+  → 所有对话都写 feedback：entropy_score + value_tier（high/medium/low）
+  → 低信息量寒暄打分很低，落 low，不删
+
+【手动链路（可选）】
+用户点击 👍/👎
+  → WebSocket 发送 `{type: "feedback", "rating": "good"|"bad"}`
+  → feedback/manager.save_feedback() 按 message_id upsert
+  → 有自动行：UPDATE manual_rating；无行：INSERT
+  → 自动排除但人工认可的对话，只需 UPDATE，不用补插
 
 【导出】
   SELECT user_message, ai_reply, emotion
   FROM feedback
-  WHERE rating='auto' AND value_tier='high'
+  WHERE (value_tier IN ('high','medium') OR manual_rating = 'good')
+    AND (manual_rating IS NULL OR manual_rating != 'bad')
   ORDER BY entropy_score DESC;
+
+  → 人工标 bad 的即使熵分高也会被排除
 
   → 未来：训练专属模型的原始数据
 
@@ -826,6 +831,8 @@ ai_reflections / ai_behaviors：不衰减、不删
 - 短期记忆从旧到新截断 → 改为从新到旧累加
 - prompt 花括号未双写导致 `KeyError`
 - `insert_feedback` 误用不存在的 `feedback_id` 列 → 改为 `id AUTOINCREMENT` + `cur.lastrowid`
+- `feedback` 表 `rating` 列混用语义（auto/good/bad/manual）→ 拆为 `value_tier`（自动分级）+ `manual_rating`（人工评价）
+- `entropy.py` 只看 user_message 的碎片化 → 改为 user_message 和 ai_reply 都算，AI 回复“没人味”也会被降权
 
 **待办（backlog）：**
 - 声纹识别（`user_manager` 接口已预留）

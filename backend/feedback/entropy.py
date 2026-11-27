@@ -63,6 +63,30 @@ def _is_low_info(user_message: str) -> bool:
         return True
     return False
 
+def _frag_repeat_penalty(text: str) -> float:
+    """句子碎片化 + 单字重复的惩罚分，0.0 – 0.45。"""
+    if not text:
+        return 0.0
+
+    sents = [s.strip() for s in re.split(r"[。！？!?\.]", text) if s.strip()]
+    n_sent = len(sents)
+    avg_len = len(text) / max(n_sent, 1)
+
+    frag = 0.0
+    if n_sent >= 4 and avg_len < 8:
+        frag = 0.25
+    elif n_sent >= 3 and avg_len < 6:
+        frag = 0.15
+
+    body = [c for c in text if c not in " \t\n。！？!?，,、；;：:"]
+    rep = 0.0
+    if body:
+        top = Counter(body).most_common(1)[0][1]
+        ratio = top / len(body)
+        if ratio > 0.15:
+            rep = min(0.2, (ratio - 0.15) * 2.0)
+
+    return frag + rep
 
 def compute_entropy_score(user_message: str, ai_reply: str = "") -> dict:
     """
@@ -91,6 +115,9 @@ def compute_entropy_score(user_message: str, ai_reply: str = "") -> dict:
     behavior_signals = question_cnt + behavior_cnt
     reply_depth = 1.0 if len(ar) > 40 else (0.5 if len(ar) > 15 else 0.0)
 
+    # 碎片化惩罚：user_message 或 ai_reply 任一碎片化都降权
+    penalty = max(_frag_repeat_penalty(um), _frag_repeat_penalty(ar))
+
     # 分项归一化（经验上限，可按你的数据分布调整）
     len_score = min(len(um) / 80, 1.0)           # 80 字封顶
     entropy_score = min(um_entropy / 4.5, 1.0)   # 中文字符熵常见 3-4.5
@@ -104,6 +131,7 @@ def compute_entropy_score(user_message: str, ai_reply: str = "") -> dict:
         + distinct_score * 0.15
         + behavior_score * 0.20
         + reply_depth * 0.05
+        - penalty
     )
     score = round(min(max(score, 0.0), 1.0), 4)
 

@@ -86,18 +86,22 @@ def _init_tables():
         CREATE INDEX IF NOT EXISTS idx_conv_session_user ON conversation_history(session_id, user_id, id);
 
         CREATE TABLE IF NOT EXISTS feedback (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id   TEXT NOT NULL,
-            session_id   TEXT NOT NULL,
-            user_id      TEXT NOT NULL,
-            user_message TEXT NOT NULL,
-            ai_reply     TEXT NOT NULL,
-            emotion      TEXT,
-            tts_emotion  TEXT,
-            rating       TEXT NOT NULL,
-            created_at   TEXT NOT NULL
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id    TEXT NOT NULL,
+            session_id    TEXT NOT NULL,
+            user_id       TEXT NOT NULL,
+            user_message  TEXT NOT NULL,
+            ai_reply      TEXT NOT NULL,
+            emotion       TEXT,
+            tts_emotion   TEXT,
+            entropy_score REAL,
+            value_tier    TEXT DEFAULT 'low',
+            manual_rating TEXT DEFAULT NULL,
+            created_at    TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_feedback_rating ON feedback(rating, created_at);
+        CREATE INDEX IF NOT EXISTS idx_feedback_tier ON feedback(value_tier, created_at);
+        CREATE INDEX IF NOT EXISTS idx_feedback_manual ON feedback(manual_rating);
+        
         CREATE TABLE IF NOT EXISTS workspace_topics (
             topic_id        TEXT PRIMARY KEY,
             user_id         TEXT NOT NULL,
@@ -330,6 +334,25 @@ def update_memory_content(memory_id: str, content: str):
     )
     conn.commit()
 
+def mark_superseded(memory_id: str, new_id: str, reason: str = "update") -> None:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE user_memories SET superseded_by = ?, supersede_reason = ?, "
+        "importance = MAX(0.1, importance * 0.5) WHERE memory_id = ?",
+        (new_id, reason, memory_id),
+    )
+    conn.commit()
+
+
+def list_active_user_memories(user_id: str, limit: int = 100) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM user_memories WHERE user_id = ? AND superseded_by IS NULL "
+        "ORDER BY created_at DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
 # ========== AI 反思 ==========
 
 def insert_reflection(user_id: str, content: str, importance: float = 0.8, evidence_ids: str = "") -> str:
@@ -465,19 +488,19 @@ def insert_feedback(
     ai_reply: str,
     emotion: str,
     tts_emotion: str,
-    rating: str,
     entropy_score: float | None = None,
-    value_tier: str = "manual",
+    value_tier: str = "low",
+    manual_rating: str | None = None,
 ) -> int:
     conn = get_conn()
     cur = conn.execute(
         "INSERT INTO feedback "
         "(message_id, session_id, user_id, user_message, ai_reply, "
-        " emotion, tts_emotion, rating, entropy_score, value_tier, created_at) "
+        " emotion, tts_emotion, entropy_score, value_tier, manual_rating, created_at) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (
             message_id, session_id, user_id, user_message, ai_reply,
-            emotion, tts_emotion, rating, entropy_score, value_tier,
+            emotion, tts_emotion, entropy_score, value_tier, manual_rating,
             _now(),
         ),
     )
@@ -488,18 +511,30 @@ def insert_feedback(
 def get_feedback_stats() -> dict:
     conn = get_conn()
     total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
-    good = conn.execute("SELECT COUNT(*) FROM feedback WHERE rating = 'good'").fetchone()[0]
-    bad = conn.execute("SELECT COUNT(*) FROM feedback WHERE rating = 'bad'").fetchone()[0]
-    return {"total": total, "good": good, "bad": bad}
+    good = conn.execute(
+        "SELECT COUNT(*) FROM feedback WHERE manual_rating = 'good'"
+    ).fetchone()[0]
+    bad = conn.execute(
+        "SELECT COUNT(*) FROM feedback WHERE manual_rating = 'bad'"
+    ).fetchone()[0]
+    high = conn.execute(
+        "SELECT COUNT(*) FROM feedback WHERE value_tier = 'high'"
+    ).fetchone()[0]
+    return {"total": total, "good": good, "bad": bad, "high": high}
 
 
 def export_feedback_jsonl(filepath: str = "") -> int:
-    """导出 good 反馈为训练用 JSONL"""
+    """导出训练用 JSONL：高价值 + 人工认可，排除人工标 bad"""
     import json
     if not filepath:
         filepath = str(Path(__file__).parent.parent / "training" / "feedback_good.jsonl")
     conn = get_conn()
-    rows = conn.execute("SELECT * FROM feedback WHERE rating = 'good' ORDER BY created_at").fetchall()
+    rows = conn.execute(
+        "SELECT user_message, ai_reply, emotion, user_id FROM feedback "
+        "WHERE (value_tier IN ('high','medium') OR manual_rating = 'good') "
+        "  AND (manual_rating IS NULL OR manual_rating != 'bad') "
+        "ORDER BY created_at"
+    ).fetchall()
     Path(filepath).parent.mkdir(parents=True, exist_ok=True)
     with open(filepath, "w", encoding="utf-8") as f:
         for r in rows:

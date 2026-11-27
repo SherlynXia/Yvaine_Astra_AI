@@ -176,11 +176,12 @@ STRONG_PROMPT = """用户这句话明确包含值得长期记住的内容。你�
 """ + _COMMON_OUTPUT_SPEC + """
 【本模式要求】
 - 直接转述用户明确表达的事实
-- **memory_layer 强制为 "user"**（用户明确要求记住的内容，一律进长期记忆，不走 workspace）
-- 若用户要求记住的是**当前话题素材/设定细节**（不是关于人本身的稳定属性），
-  content 必须以「（话题素材）」开头，便于后续识别
+- memory_layer 由内容性质决定，不要一律塞进 user：
+  * 关于人本身的稳定属性 → "user"
+  * 当前话题素材 / 设定 / 角色 / 情节 → "workspace"，item_type 按内容填
+  * 拿不准 → "workspace"（工作记忆可恢复，长期记忆清理代价高）
   例：用户说"记住，绘星的设定是有行星" →
-      {{"memory_layer":"user","type":"fact","content":"（话题素材）绘星的设定是有行星","evidence":"绘星的设定是有行星",...}}
+      {{"memory_layer":"workspace","item_type":"setting","content":"绘星的设定是有行星","topic_hint":"绘星设定",...}}
 - 只有当这句话确实无法提取任何明确事实时，才输出 []
 - evidence 必须原样出现在用户原话中
 
@@ -392,6 +393,18 @@ async def _llm_consolidate(
     except Exception as e:
         print(f"[Memory] ⚠️ 多条整合 LLM 失败: {e}", flush=True)
         return None
+
+async def _llm_check_conflict(provider, old_content: str, new_content: str) -> bool:
+    prompt = (
+        "判断下面两条记忆是否矛盾（同一件事，新旧说法不能同时成立）。\n"
+        f"旧：{old_content}\n新：{new_content}\n"
+        "只回答 yes 或 no。"
+    )
+    try:
+        raw = await provider.chat([{"role": "user", "content": prompt}], temperature=0.1)
+        return "yes" in (raw or "").lower()
+    except Exception:
+        return False
 
 def _daily_count(user_id: str) -> int:
     from datetime import timedelta
@@ -616,11 +629,19 @@ async def extract_and_store(provider: LLMProvider, user_id: str, user_message: s
             print(f"[Memory] ⏭️ 跳过: evidence 不在用户原话中", flush=True)
             continue
 
+        # 兜底：LLM 打了「（话题素材）」前缀 → 强制分流到 workspace，并去掉前缀
+        if content.startswith("（话题素材）"):
+            memory_layer = "workspace"
+            content = content[len("（话题素材）"):].strip()
+            if not content:
+                continue
+            print(f"[Memory] 🔀 前缀识别为话题素材，改走 workspace", flush=True)
+
         # ===== 分流：workspace 走独立路径 =====
         if memory_layer not in ("user", "workspace"):
             memory_layer = "user"
-        if strong:
-            memory_layer = "user"   # strong 模式强制进长期记忆
+        # strong 模式不再强制转 user：由 LLM 按内容性质判定
+        # 用户说"记住"的话题素材应该进 workspace，不污染长期记忆
 
         if memory_layer == "workspace":
             item_type = str(item.get("item_type", "setting")).strip()
@@ -733,17 +754,16 @@ async def extract_and_store(provider: LLMProvider, user_id: str, user_message: s
                     expires_at = (datetime.now() + timedelta(days=days)).isoformat()
             except (TypeError, ValueError):
                 pass
+        # invalidate/update：先不删，等新记忆写入后标记 superseded
+        supersede_target = None
         if action in ("invalidate", "update") and target_id:
             row = conn.execute(
                 "SELECT memory_id, content FROM user_memories WHERE memory_id LIKE ?",
                 (f"{target_id}%",),
             ).fetchone()
             if row:
-                full_id = row["memory_id"]
-                conn.execute("DELETE FROM user_memories WHERE memory_id = ?", (full_id,))
-                conn.commit()
-                vector_store.delete_user_memory(full_id)
-                print(f"[Memory] 🗑️ 失效旧记忆: {row['content']}", flush=True)
+                supersede_target = (row["memory_id"], action)
+                print(f"[Memory] 🔖 待标记失效: {row['content']}", flush=True)
             else:
                 print(f"[Memory] ⚠️ 找不到目标记忆: {target_id}", flush=True)
 
@@ -874,6 +894,13 @@ async def extract_and_store(provider: LLMProvider, user_id: str, user_message: s
             )
             continue
 
+        if candidates and min_dist < 0.35:
+            old_top = database.get_user_memory(candidates[0]["memory_id"])
+            if old_top:
+                conflict = await _llm_check_conflict(provider, old_top["content"], content)
+                if conflict:
+                    supersede_target = (old_top["memory_id"], "update")
+
         memory_id = database.insert_user_memory(
             user_id=user_id,
             mem_type=mem_type,
@@ -884,6 +911,14 @@ async def extract_and_store(provider: LLMProvider, user_id: str, user_message: s
             source_id=source_id,
             expires_at=expires_at,
         )
+
+        if supersede_target:
+            old_id, old_action = supersede_target
+            database.mark_superseded(
+                old_id, new_id=memory_id,
+                reason="contradict" if old_action == "invalidate" else "update",
+            )
+            vector_store.update_user_memory_metadata(old_id, {"superseded_by": memory_id})
 
         if mem_type == "fact" and subject_id == user_id and scope == "private":
             _maybe_update_user_name(user_id, content)

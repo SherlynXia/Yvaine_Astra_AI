@@ -94,6 +94,12 @@ def add_user_memory(memory_id: str, content: str, user_id: str, metadata: dict |
         meta.update(metadata)
     _add("user_memories", memory_id, content, meta)
 
+def update_user_memory_metadata(memory_id: str, metadata: dict) -> None:
+    col = _get_collection("user_memories")
+    try:
+        col.update(ids=[memory_id], metadatas=[metadata])
+    except Exception as e:
+        print(f"[Vector] ⚠️ 更新 metadata 失败 {memory_id[:8]}: {e}", flush=True)
 
 def query_user_memories(query_text: str, where: dict, top_k: int = 5) -> list[dict]:
     return _query("user_memories", query_text, where, top_k)

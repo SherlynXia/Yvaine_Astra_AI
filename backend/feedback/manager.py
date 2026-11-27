@@ -6,48 +6,60 @@ from .entropy import compute_entropy_score
 
 
 def save_feedback(context: dict, rating: str) -> bool:
-    """手动反馈，保持原行为，rating 只能是 good/bad。"""
+    """人工评价：有自动行就 UPDATE manual_rating，没有就 INSERT 一行"""
     if rating not in ("good", "bad"):
         return False
+    message_id = context.get("message_id", "")
+    if not message_id:
+        return False
     try:
+        conn = database.get_conn()
+        row = conn.execute(
+            "SELECT id FROM feedback WHERE message_id = ?", (message_id,)
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE feedback SET manual_rating = ? WHERE id = ?",
+                (rating, row["id"]),
+            )
+            conn.commit()
+            print(f"[Feedback] ✅ 人工标记 {rating}: {message_id[:8]}", flush=True)
+            return True
+
+        # 兜底：自动行没写（服务重启期间），补插一行
+        metrics = compute_entropy_score(
+            context.get("user_message", ""), context.get("ai_reply", "")
+        )
         database.insert_feedback(
-            message_id=context.get("message_id", ""),
+            message_id=message_id,
             session_id=context.get("session_id", ""),
             user_id=context.get("user_id", "default"),
             user_message=context.get("user_message", ""),
             ai_reply=context.get("ai_reply", ""),
             emotion=context.get("emotion", ""),
             tts_emotion=context.get("tts_emotion", ""),
-            rating=rating,
-            entropy_score=None,
-            value_tier="manual",
+            entropy_score=metrics["score"],
+            value_tier=metrics["tier"],
+            manual_rating=rating,
         )
+        print(f"[Feedback] ✅ 人工评价补插 {rating}: {message_id[:8]}", flush=True)
         return True
     except Exception as e:
-        print(f"[Feedback] ❌ 手动反馈写入失败: {e}", flush=True)
+        print(f"[Feedback] ❌ 人工反馈写入失败: {e}", flush=True)
         return False
 
 
 def save_auto_candidate(context: dict) -> dict:
-    """
-    每轮对话都调用：先算熵，再走筛网。
-    返回打分结果，方便调用方打日志；低价值/丢弃的不写库。
-    """
+    """每轮对话都打分并写库，low/drop 也写，供人工救回"""
     um = context.get("user_message", "") or ""
     ar = context.get("ai_reply", "") or ""
+    if not um.strip():
+        return {"score": 0.0, "tier": "drop", "metrics": {}}
 
     result = compute_entropy_score(um, ar)
-    score = result["score"]
     tier = result["tier"]
-
-    # 筛网：drop 和 low 都不进候选池
-    if tier in ("drop", "low"):
-        print(
-            f"[Feedback] 🧹 筛除 tier={tier} score={score:.3f} "
-            f"| {um[:40]!r}",
-            flush=True,
-        )
-        return result
+    if tier == "drop":
+        tier = "low"   # 统一成 low，避免 value_tier 出现 drop
 
     try:
         database.insert_feedback(
@@ -58,18 +70,16 @@ def save_auto_candidate(context: dict) -> dict:
             ai_reply=ar,
             emotion=context.get("emotion", ""),
             tts_emotion=context.get("tts_emotion", ""),
-            rating="auto",
-            entropy_score=score,
+            entropy_score=result["score"],
             value_tier=tier,
+            manual_rating=None,
         )
         print(
-            f"[Feedback] ✅ 候选 tier={tier} score={score:.3f} "
-            f"metrics={result['metrics']} | {um[:40]!r}",
+            f"[Feedback] 📝 {tier} score={result['score']:.3f} | {um[:40]!r}",
             flush=True,
         )
     except Exception as e:
         print(f"[Feedback] ❌ 自动候选写入失败: {e}", flush=True)
-
     return result
 
 

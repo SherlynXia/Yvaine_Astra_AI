@@ -317,14 +317,11 @@ def get_relationship_block(user_id: str, user_name: str) -> str:
 
 # ========== 隐私梯度 ==========
 
-# 自己的记忆门槛（AI ↔ 用户 intimacy）
+# 只约束“别人的记忆”；自己的记忆对本人始终可见
 _VISIBILITY_THRESHOLDS = {
-    ("fact", "private"):    {"own": 15, "other": None},
-    ("fact", "shared"):     {"own": 0,  "other": 0},
-    ("event", "private"):   {"own": 20, "other": None},
-    ("event", "shared"):    {"own": 0,  "other": 0},
-    ("emotion", "private"): {"own": 30, "other": None},
-    ("emotion", "shared"):  {"own": 10, "other": 0},
+    ("fact", "shared"):     {"other": 0},
+    ("event", "shared"):    {"other": 0},
+    ("emotion", "shared"):  {"other": 0},
 }
 
 # 别人的 shared 记忆需要 A-B 关系 closeness 达到的门槛
@@ -352,12 +349,9 @@ def check_memory_visibility(
         (mem_type, scope), {"own": 999, "other": None}
     )
 
-    # 自己的记忆
+    # 自己的记忆：对本人永远可见，隐私梯度只约束“别人的记忆”
     if subject_id == current_user_id:
-        min_imp = threshold["own"]
-        if min_imp is not None and current_intimacy >= min_imp:
-            return True, "[你]"
-        return False, ""
+        return True, "[你]"
 
     # 别人的 private：永不
     if scope == "private":
